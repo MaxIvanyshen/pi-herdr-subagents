@@ -399,7 +399,10 @@ function armWatcher(
 // ── tool parameter schema (ported, minus Claude-only resumeSessionId) ───────
 
 const SubagentParams = Type.Object({
-  name: Type.String({ description: "Display name for the subagent" }),
+  name: Type.String({
+    description:
+      "Display name for the subagent. Also becomes the herdr tab label — keep it short (1-3 words, e.g. 'Refactor auth'), not a full sentence.",
+  }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
   agent: Type.Optional(
     Type.String({
@@ -563,8 +566,9 @@ async function executeSubagentSpawn(
     const message = error?.message ?? String(error);
     return errorResult(`Failed to start herdr pane for "${params.name}": ${message}`, message);
   }
-  // Best-effort sidebar label; the pane is already running the subagent.
+  // Best-effort sidebar/tab label; the pane is already running the subagent.
   await deps.client.paneRename(started.paneId, params.name).catch(() => {});
+  if (started.tabId) await deps.client.tabRename(started.tabId, params.name).catch(() => {});
 
   const running: RunningSubagent = {
     id: plan.id,
@@ -785,8 +789,9 @@ async function executeSubagentResume(
     const message = error?.message ?? String(error);
     return errorResult(`Failed to start herdr pane for "${plan.name}": ${message}`, message);
   }
-  // Best-effort sidebar label; the pane is already running the subagent.
+  // Best-effort sidebar/tab label; the pane is already running the subagent.
   await deps.client.paneRename(started.paneId, plan.name).catch(() => {});
+  if (started.tabId) await deps.client.tabRename(started.tabId, plan.name).catch(() => {});
 
   const running: RunningSubagent = {
     id: plan.id,
@@ -825,7 +830,10 @@ function registerResumeTool(pi: ExtensionAPI): void {
     parameters: Type.Object({
       sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
       name: Type.Optional(
-        Type.String({ description: "Display name for the herdr pane. Default: 'Resume'" }),
+        Type.String({
+          description:
+            "Display name for the herdr pane and tab. Keep it short (1-3 words). Default: 'Resume'",
+        }),
       ),
       message: Type.Optional(
         Type.String({
@@ -971,6 +979,81 @@ function registerInterruptTool(pi: ExtensionAPI): void {
             " " +
             theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
             theme.fg("dim", " — interrupt requested"),
+          0,
+          0,
+        );
+      }
+
+      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      return new Text(theme.fg("dim", text), 0, 0);
+    },
+  });
+}
+
+async function handleSubagentSteer(params: { id?: string; name?: string; message: string }) {
+  const resolved = resolveInterruptTarget(params);
+  if ("error" in resolved) {
+    return errorResult(resolved.error, resolved.error);
+  }
+
+  const running = resolved.running;
+  try {
+    await deps.client.agentPrompt(running.paneId, params.message);
+  } catch (error: any) {
+    const message =
+      `Failed to steer subagent "${running.name}" via herdr: ` + `${error?.message ?? String(error)}`;
+    return {
+      content: [{ type: "text" as const, text: message }],
+      details: { error: error?.message ?? String(error), id: running.id, name: running.name },
+    };
+  }
+
+  return {
+    content: [{ type: "text" as const, text: `Message sent to subagent "${running.name}".` }],
+    details: { id: running.id, name: running.name, status: "steered" },
+  };
+}
+
+const STEER_DESCRIPTION =
+  "Send a message into a currently running subagent's active turn (steer), without waiting for it to finish or interrupting it. " +
+  "The child picks it up as soon as it's ready \u2014 same mechanism as a human typing into its pane.";
+
+function registerSteerTool(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "subagent_steer",
+    label: "Steer Subagent",
+    description: STEER_DESCRIPTION,
+    promptSnippet: STEER_DESCRIPTION,
+    parameters: Type.Object({
+      id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+      name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+      message: Type.String({ description: "Message to inject into the subagent's active turn" }),
+    }),
+
+    async execute(_toolCallId, params) {
+      return handleSubagentSteer(params);
+    },
+
+    renderCall(args, theme) {
+      const target = (args as any).id ? `${(args as any).id}` : ((args as any).name ?? "(unknown)");
+      return new Text(
+        theme.fg("accent", "▸") +
+          " " +
+          theme.fg("toolTitle", theme.bold(target)) +
+          theme.fg("dim", " — steer"),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as any;
+      if (details?.status === "steered") {
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
+            theme.fg("dim", " — message sent"),
           0,
           0,
         );
@@ -1171,6 +1254,7 @@ export default function herdrSubagents(pi: ExtensionAPI) {
     if (shouldRegister("subagent")) registerSubagentTool(pi);
     if (shouldRegister("subagent_resume")) registerResumeTool(pi);
     if (shouldRegister("subagent_interrupt")) registerInterruptTool(pi);
+    if (shouldRegister("subagent_steer")) registerSteerTool(pi);
     if (shouldRegister("subagents_list")) registerListTool(pi);
     registerCommands(pi);
     registeredRealTools = true;
