@@ -197,7 +197,6 @@ All configuration is via environment variables (set globally, or per-project via
 | `PI_HERDR_HOLD_OPEN_SECS` | `15` | Startup-crash window: if the child exits nonzero within this many seconds, the pane is held open for post-mortem (`0` disables). |
 | `HERDR_BIN` | `herdr` on `PATH` | herdr binary override. |
 | `PI_SUBAGENT_IDLE_SECS` | `600` | An auto-exit child that the decider kept open exits as done after this long with no input. |
-| `TYPESAFE_API_KEY` / `JEV_API_KEY` | *(unset)* | Key for the idle decider. Children don't inherit your shell's env, so `~/.pi/subagent-decider/typesafe-key` (chmod 600) is the reliable place. |
 
 ### Idle decision: done or waiting on you? (experimental)
 
@@ -212,6 +211,11 @@ the decider.
 The decider leans toward exiting. A wrong exit is cheap, because the parent can resume the
 subagent, while a wrong keep-open stalls the parent. On ~200 replayed subagent sessions plus
 hand-written edge cases, it kept no finished report open.
+
+To set it up, run `/subagent-decider key` and paste your [TypeSafe](https://docs.typesafe.ai) API
+key. The prompt masks the key and checks it with TypeSafe. If TypeSafe accepts it, the key is
+saved to `~/.pi/subagent-decider/typesafe-key`, readable only by you. Subagents don't inherit your
+shell's environment, so a `TYPESAFE_API_KEY` exported there won't reach them.
 
 `/subagent-decider off` turns it off. Nothing is then sent to api.typesafe.ai, and the `auto-exit`
 flag decides, as it also does without a key or when Jev doesn't answer within 3s.
@@ -247,7 +251,7 @@ Set `PI_HERDR_DIRENV=0` or an explicit `PI_HERDR_LAUNCH_PREFIX` to override.
 | `/subagent <agent> [task]` | Spawn a named agent directly |
 | `/subagents-init [global\|project]` | Copy missing example agent definitions into user-owned config |
 | `/iterate [task]` | Fork the current session into a subagent for focused work |
-| `/subagent-decider [jev\|off]` | Pick who decides whether an idle subagent exits (see [Idle decision](#idle-decision-done-or-waiting-on-you-experimental)) |
+| `/subagent-decider [jev\|off\|key]` | Turn the idle decider on or off, or save its API key (see [Idle decision](#idle-decision-done-or-waiting-on-you-experimental)) |
 
 Agent definitions in project-local `.pi/agents/*.md` or global `~/.pi/agent/agents/*.md` are read
 with the same frontmatter semantics as pi-interactive-subagents (name, description, tools,

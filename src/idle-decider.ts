@@ -11,7 +11,7 @@
  * Benchmarked on ~200 replayed subagent sessions plus hand-written edge cases:
  * AUC 0.993, no finished report kept open on the held-out split.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -45,14 +45,43 @@ export function writeDeciderMode(mode: DeciderMode): void {
  */
 export const jevKeyFile = () => join(deciderDir(), "typesafe-key");
 
-export function readJevKey(): string | undefined {
-  const fromEnv = process.env.TYPESAFE_API_KEY || process.env.JEV_API_KEY;
-  if (fromEnv) return fromEnv;
+/** Owner-only: agents running as you can still read it, but no one else can. */
+export function saveJevKey(key: string): void {
+  mkdirSync(deciderDir(), { recursive: true, mode: 0o700 });
+  writeFileSync(jevKeyFile(), key + "\n", { mode: 0o600 });
+  chmodSync(jevKeyFile(), 0o600); // mode above only applies when the file is created
+}
+
+/** One real, tiny Jev call to tell a bad key from a network problem. */
+export async function checkJevKey(key: string, url = JEV_URL): Promise<"ok" | "rejected" | "unreachable"> {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "jev-latest",
+        state: "Key check.",
+        questions: { q: { type: "noul", instructions: "Is this a key check?" } },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.ok) return "ok";
+    return res.status === 401 || res.status === 403 ? "rejected" : "unreachable";
+  } catch {
+    return "unreachable";
+  }
+}
+
+export function savedJevKey(): string | undefined {
   try {
     return readFileSync(jevKeyFile(), "utf8").trim() || undefined;
   } catch {
     return undefined;
   }
+}
+
+export function readJevKey(): string | undefined {
+  return process.env.TYPESAFE_API_KEY || process.env.JEV_API_KEY || savedJevKey();
 }
 
 // String content as-is, part lists joined and trimmed — as in the benchmark data.

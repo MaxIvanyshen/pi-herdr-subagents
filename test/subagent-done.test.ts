@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,7 +12,7 @@ import {
   writeExitSidecar,
 } from "../subagent-done.ts";
 import { writeContextUsageSidecar } from "../src/context-usage.ts";
-import { writeDeciderMode } from "../src/idle-decider.ts";
+import { checkJevKey, jevKeyFile, readJevKey, saveJevKey, writeDeciderMode } from "../src/idle-decider.ts";
 import {
   clearActiveSubagents,
   markSubagentActive,
@@ -682,6 +682,21 @@ describe("subagent-done: Jev decides exit vs keep-open", () => {
     handlers.input({}, ctx);
     await new Promise((r) => setTimeout(r, 120));
     assert.equal(state.shutdown, false);
+  });
+
+  it("saves the key owner-only, where children find it", async () => {
+    await launch({});
+    saveJevKey("sk-test-1234");
+    assert.equal(statSync(jevKeyFile()).mode & 0o777, 0o600);
+    assert.equal(readJevKey(), "sk-test-1234");
+  });
+
+  it("key check tells a rejected key from an unreachable service", async () => {
+    const ok = await fakeJev(FINISHED);
+    const rejected = await fakeJev(FINISHED, 401);
+    assert.equal(await checkJevKey("k", ok.url), "ok");
+    assert.equal(await checkJevKey("k", rejected.url), "rejected");
+    assert.equal(await checkJevKey("k", "http://127.0.0.1:1"), "unreachable");
   });
 
   it("skips Jev on interactive turns the user started", async () => {
