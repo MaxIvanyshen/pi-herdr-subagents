@@ -13,7 +13,8 @@
 // waits for the next turn (the orchestrator's steer) instead of reporting.
 // Failures append the reason as the result line and write a nonzero exitcode
 // sidecar, so the watcher reports them as a crash with that reason.
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants, readFileSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import type { PaneInfo } from "./herdr/client.ts";
 
@@ -26,6 +27,21 @@ export const HERDR_AGENT_KINDS = new Set([
 
 /** Session-file suffix for herdr-driven agents: our result line, not a resumable pi session. */
 export const HERDR_AGENT_SESSION_SUFFIX = ".agent.jsonl";
+
+/** Herdr agent kinds whose executable (the kind name) is on PATH. */
+export function installedHerdrAgentKinds(path = process.env.PATH ?? ""): string[] {
+  const dirs = path.split(":").filter(Boolean);
+  return [...HERDR_AGENT_KINDS].filter((kind) =>
+    dirs.some((dir) => {
+      try {
+        accessSync(join(dir, kind), constants.X_OK);
+        return statSync(join(dir, kind)).isFile();
+      } catch {
+        return false;
+      }
+    }),
+  );
+}
 
 export function isHerdrAgentSessionFile(sessionFile: string): boolean {
   return sessionFile.endsWith(HERDR_AGENT_SESSION_SUFFIX);

@@ -1,10 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { driveHerdrAgent, type HerdrAgentRun } from "../src/herdr-agent.ts";
+import { driveHerdrAgent, installedHerdrAgentKinds, type HerdrAgentRun } from "../src/herdr-agent.ts";
 import { findLastAssistantMessage, getNewEntries } from "../src/session.ts";
 
 interface Opts {
@@ -133,5 +133,17 @@ describe("driveHerdrAgent", () => {
     await driveHerdrAgent(settled.run, settled.deps);
     assert.deepEqual(settled.calls, []);
     assert.equal(existsSync(settled.run.sessionFile), false);
+  });
+});
+
+describe("installedHerdrAgentKinds", () => {
+  it("lists only known kinds with an executable file on PATH", () => {
+    const dir = mkdtempSync(join(tmpdir(), "kinds-"));
+    for (const [name, mode] of [["codex", 0o755], ["gemini", 0o644], ["notanagent", 0o755]] as const) {
+      writeFileSync(join(dir, name), "#!/bin/sh\n");
+      chmodSync(join(dir, name), mode);
+    }
+    mkdirSync(join(dir, "claude")); // a directory is not an executable
+    assert.deepEqual(installedHerdrAgentKinds(`/nonexistent:${dir}`), ["codex"]);
   });
 });

@@ -219,6 +219,7 @@ Set `PI_HERDR_DIRENV=0` or an explicit `PI_HERDR_LAUNCH_PREFIX` to override.
 | `subagent_resume` | Resume a previous sub-agent session in a new pane (async) |
 | `subagent_interrupt` | Send Escape to a running subagent's active turn |
 | `subagents_list` | List available agent definitions (project-local `.pi/agents/` overrides global) |
+| `subagent_clis` | List the coding agents installed here (pi + herdr-detected kinds on PATH) usable as `subagent`'s `cli`, plus agent definitions that preset one |
 
 | Command | Description |
 |---|---|
