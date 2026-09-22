@@ -185,6 +185,29 @@ All configuration is via environment variables (set globally, or per-project via
 | `PI_HERDR_DIRENV` | *(unset)* | Set to `0` to disable the `direnv exec` autodetect (see below). |
 | `PI_HERDR_HOLD_OPEN_SECS` | `15` | Startup-crash window: if the child exits nonzero within this many seconds, the pane is held open for post-mortem (`0` disables). |
 | `HERDR_BIN` | `herdr` on `PATH` | herdr binary override. |
+| `PI_LAYA_URL` | `http://127.0.0.1:8771` | Laya sidecar the child asks "done or waiting on you?" (see below). |
+| `PI_LAYA_IDLE_SECS` | `600` | An auto-exit child that Laya kept open exits as done after this long with no input. |
+
+### Idle decision via Laya (experimental)
+
+When a child's turn ends cleanly, it asks a local [Laya](https://brainfunctioncollapse.com/laya)
+sidecar whether the last message is a finished report or a question for the user. If Laya says
+done, the child exits with `completed`, **even if `auto-exit` is off**. If it sees a question, the
+pane stays open, even when `auto-exit` is on. Interactive turns you started yourself skip Laya.
+If the sidecar isn't running, the plain `auto-exit` flag decides, as before.
+
+```bash
+uv run --python 3.12 --with laya python laya/server.py         # ~30s first load, then ~50ms/call
+uv run --python 3.12 --with laya python laya/server.py --eval  # held-out accuracy
+```
+
+It is tuned to lean toward exiting. A wrong exit is cheap, because the parent can resume the
+subagent. A wrong keep-open stalls the parent, so it costs `LAYA_KEEP_OPEN_COST` (default 5)
+times more in the threshold fit. The threshold is fit on:
+- the `laya/examples.jsonl` seeds;
+- your past subagent sessions in `~/.pi/agent/sessions`;
+- your labels in `~/.pi/laya/labels.jsonl`. A kept-open pane you reply to is labelled
+  "needs input", and one you close without replying is labelled "done".
 
 ### direnv / devenv / varlock repos
 

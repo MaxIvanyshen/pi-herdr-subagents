@@ -1,6 +1,7 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -521,5 +522,138 @@ describe("subagent-done: agent_end writes .exit sidecar on clean auto-exit", () 
     let sidecarExists = false;
     try { readFileSync(`${sessionFile}.exit`); sidecarExists = true; } catch {}
     assert.equal(sidecarExists, false, "must not signal completion before children settle");
+  });
+});
+
+describe("subagent-done: Laya decides exit vs keep-open", () => {
+  const reply = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "report" }] }];
+
+  // Fake laya/server.py: /decide answers `done`, /label requests are recorded.
+  async function fakeLaya(done: boolean) {
+    const labels: any[] = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        if (req.url === "/label") labels.push(JSON.parse(body));
+        res.end(JSON.stringify({ done }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    cleanups.push(() => server.close());
+    return { url: `http://127.0.0.1:${(server.address() as any).port}`, labels };
+  }
+
+  async function launch(env: Record<string, string>) {
+    const dir = mkdtempSync(join(tmpdir(), "herdr-done-"));
+    const sessionFile = join(dir, "child.jsonl");
+    const all = { PI_SUBAGENT_SESSION: sessionFile, PI_SUBAGENT_AUTO_EXIT: "0", ...env };
+    const orig = Object.fromEntries(Object.keys(all).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, all);
+    cleanups.push(() => {
+      rmSync(dir, { recursive: true, force: true });
+      for (const [k, v] of Object.entries(orig)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+    });
+
+    const handlers: Record<string, Function> = {};
+    const state = { shutdown: false };
+    const ctx = { shutdown: () => { state.shutdown = true; }, ui: { setWidget: () => {} } };
+    const mod = await import("../subagent-done.ts");
+    mod.default({
+      on: (e: string, h: Function) => { handlers[e] = h; },
+      registerTool: () => {},
+      registerShortcut: () => {},
+      getAllTools: () => [],
+    } as any);
+    handlers.agent_start({}, ctx);
+    return { handlers, ctx, state, sessionFile };
+  }
+
+  it("closes an interactive subagent Laya judges done", async () => {
+    const laya = await fakeLaya(true);
+    const { handlers, ctx, state, sessionFile } = await launch({ PI_LAYA_URL: laya.url });
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(state.shutdown, true);
+    assert.equal(readFileSync(`${sessionFile}.exit`, "utf8"), '{"type":"done"}');
+  });
+
+  it("keeps an auto-exit subagent open when Laya sees a question, labels it on reply", async () => {
+    const laya = await fakeLaya(false);
+    const { handlers, ctx, state, sessionFile } = await launch({
+      PI_LAYA_URL: laya.url,
+      PI_SUBAGENT_AUTO_EXIT: "1",
+    });
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(state.shutdown, false);
+    assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+    handlers.input({}, ctx);
+    for (let i = 0; i < 50 && laya.labels.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.deepEqual(laya.labels, [{ text: "report", done: false }]);
+  });
+
+  it("labels done when a kept-open pane closes without input", async () => {
+    const laya = await fakeLaya(false);
+    const { handlers, ctx } = await launch({ PI_LAYA_URL: laya.url });
+    await handlers.agent_end({ messages: reply }, ctx);
+    await handlers.session_shutdown({}, { ...ctx, getContextUsage: () => undefined });
+    assert.deepEqual(laya.labels, [{ text: "report", done: true }]);
+  });
+
+  it("falls back to the autoExit flag when the sidecar is unreachable", async () => {
+    const { handlers, ctx, state } = await launch({
+      PI_LAYA_URL: "http://127.0.0.1:1",
+      PI_SUBAGENT_AUTO_EXIT: "1",
+    });
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(state.shutdown, true);
+  });
+
+  it("never shuts down a turn the user started while Laya was unreachable", async () => {
+    const { handlers, ctx, state } = await launch({
+      PI_LAYA_URL: "http://127.0.0.1:1",
+      PI_SUBAGENT_AUTO_EXIT: "1",
+    });
+    const pending = handlers.agent_end({ messages: reply }, ctx);
+    handlers.input({}, ctx); // typed during the await
+    await pending;
+    assert.equal(state.shutdown, false);
+  });
+
+  it("gives up on a kept-open auto-exit subagent after the idle timeout, unlabelled", async () => {
+    const laya = await fakeLaya(false);
+    const { handlers, ctx, state, sessionFile } = await launch({
+      PI_LAYA_URL: laya.url,
+      PI_SUBAGENT_AUTO_EXIT: "1",
+      PI_LAYA_IDLE_SECS: "0.05",
+    });
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(state.shutdown, false);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(state.shutdown, true);
+    assert.equal(readFileSync(`${sessionFile}.exit`, "utf8"), '{"type":"done"}');
+    await handlers.session_shutdown({}, { ...ctx, getContextUsage: () => undefined });
+    assert.deepEqual(laya.labels, []);
+  });
+
+  it("input cancels the idle timeout", async () => {
+    const laya = await fakeLaya(false);
+    const { handlers, ctx, state } = await launch({
+      PI_LAYA_URL: laya.url,
+      PI_SUBAGENT_AUTO_EXIT: "1",
+      PI_LAYA_IDLE_SECS: "0.05",
+    });
+    await handlers.agent_end({ messages: reply }, ctx);
+    handlers.input({}, ctx);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(state.shutdown, false);
+  });
+
+  it("skips Laya on interactive turns the user started", async () => {
+    const laya = await fakeLaya(true);
+    const { handlers, ctx, state } = await launch({ PI_LAYA_URL: laya.url });
+    handlers.input({}, ctx); // after agent_start → user took over
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(state.shutdown, false);
   });
 });

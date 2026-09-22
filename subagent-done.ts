@@ -68,6 +68,47 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/** Text of the latest assistant message that has any — what Laya judges. */
+export function lastAssistantText(messages: any[] | undefined): string {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    const msg = messages![i];
+    if (msg?.role === "user") break; // don't judge a previous turn's message
+    if (msg?.role !== "assistant") continue;
+    const text =
+      typeof msg.content === "string"
+        ? msg.content
+        : (msg.content ?? [])
+            .filter((c: any) => c?.type === "text")
+            .map((c: any) => c.text)
+            .join("\n");
+    if (text.trim()) return text;
+  }
+  return "";
+}
+
+async function layaPost(url: string, body: object, timeoutMs: number): Promise<any> {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ask the Laya sidecar (laya/server.py) whether `text` is a finished report
+ * (true) or waits on the reader (false). null = sidecar unreachable/slow.
+ */
+export async function layaDecide(baseUrl: string, text: string): Promise<boolean | null> {
+  const out = await layaPost(`${baseUrl}/decide`, { text }, 1500);
+  return typeof out?.done === "boolean" ? out.done : null;
+}
+
 export type ExitSidecarData =
   | { type: "done" }
   | { type: "ping"; name: string; message: string };
@@ -96,6 +137,8 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const layaUrl = process.env.PI_LAYA_URL ?? "http://127.0.0.1:8771";
+  const layaIdleMs = Number(process.env.PI_LAYA_IDLE_SECS ?? 600) * 1000;
 
   function renderWidget(ctx: { ui: { setWidget: Function } }) {
     ctx.ui.setWidget(
@@ -152,6 +195,10 @@ export default function (pi: ExtensionAPI) {
   let agentStarted = false;
   let contextUsageWritten = false;
   let terminalSidecarWritten = false;
+  // Laya kept the pane open for this message; the user's next move labels it.
+  let keptOpenText: string | null = null;
+  let inputSinceAgentEnd = false;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
   function signalTerminalSidecar(data: ExitSidecarData): void {
     if (terminalSidecarWritten) return;
@@ -198,6 +245,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("input", () => {
+    inputSinceAgentEnd = true;
+    clearTimeout(idleTimer);
+    if (keptOpenText) {
+      // The user answered — Laya was right to keep it open.
+      void layaPost(`${layaUrl}/label`, { text: keptOpenText, done: false }, 5000);
+      keptOpenText = null;
+    }
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
@@ -206,13 +260,39 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    // A new turn without input (e.g. a nested subagent result) moots the pending label.
+    keptOpenText = null;
+    clearTimeout(idleTimer);
   });
 
-  pi.on("agent_end", (event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit =
-      autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages, getActiveSubagentCount());
+    const turnSettled = shouldAutoExitOnAgentEnd(userTookOver, messages, getActiveSubagentCount());
+    let shouldExit = autoExit && turnSettled;
+
+    // Let Laya decide done vs. waiting-on-the-user, except for interactive turns
+    // the user started themselves: they're at the pane. Unreachable sidecar →
+    // plain autoExit behaviour.
+    const text = lastAssistantText(messages);
+    if (turnSettled && text && !terminalSidecarWritten && (autoExit || !userTookOver)) {
+      inputSinceAgentEnd = false;
+      const done = await layaDecide(layaUrl, text);
+      // Input during the await (user or subagent_steer) started a new turn — never kill it.
+      shouldExit = (done ?? shouldExit) && !inputSinceAgentEnd;
+      if (done === false && !inputSinceAgentEnd) {
+        keptOpenText = text;
+        // An autonomous parent is waiting on this pane. If nobody answers,
+        // give up and report done — a wrong exit is cheap, the parent can resume.
+        if (autoExit) {
+          idleTimer = setTimeout(() => {
+            keptOpenText = null; // ambiguous outcome: don't label it
+            snapshotContextUsage(ctx);
+            signalTerminalSidecar({ type: "done" });
+            ctx.shutdown();
+          }, layaIdleMs);
+        }
+      }
+    }
 
     if (shouldExit) {
       // Write the .exit sidecar so the watcher classifies this as a proper
@@ -234,8 +314,13 @@ export default function (pi: ExtensionAPI) {
 
   // User-driven exits do not pass through a terminal tool or clean agent_end.
   // Do not overwrite a snapshot already published by another terminal path.
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     snapshotContextUsage(ctx, true);
+    clearTimeout(idleTimer);
+    // Kept open, then closed without a word — it was done after all.
+    // ponytail: also fires when the parent kills the pane; noisy label, but the idle
+    // timeout now ends most stuck panes before anyone has to kill them.
+    if (keptOpenText) await layaPost(`${layaUrl}/label`, { text: keptOpenText, done: true }, 5000);
   });
 
   // Toggle expand/collapse with Ctrl+J
