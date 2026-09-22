@@ -115,6 +115,19 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const DEFAULT_HOLD_OPEN_SECS = 15;
 
+/** Renders claude stream-json as readable pane output: text, tool calls, final status. */
+const CLAUDE_STREAM_JQ =
+  'if .type == "assistant" then (.message.content[] | ' +
+  'if .type == "text" then .text + "\\n\\n" ' +
+  'elif .type == "tool_use" then "→ \\(.name) \\(.input | tostring | .[0:160])\\n" ' +
+  'else empty end) ' +
+  'elif .type == "result" then "\\n[claude \\(.subtype)]\\n" else empty end';
+
+/** Claude children's session file is claude stream-json, not a resumable/steerable pi session. */
+export function isClaudeSessionFile(sessionFile: string): boolean {
+  return sessionFile.endsWith(".claude.jsonl");
+}
+
 /** Ported from pi-interactive-subagents cmux.ts — the only thing taken from cmux.ts. */
 export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -257,11 +270,17 @@ function buildWrapperScript(opts: {
   cwd: string;
   piArgv: string[];
   sessionFile: string;
+  /** Raw shell appended to the command (e.g. `< task | tee …`); enables pipefail. */
+  commandSuffix?: string;
+  /** Raw shell lines run after `code=$?`, before the exitcode sidecar. */
+  afterCommand?: string[];
 }): { content: string; holdOpenSecs: number } {
   const launchPrefix = resolveLaunchPrefix(opts.env, opts.cwd);
   const holdOpenSecs = resolveHoldOpenSecs(opts.env);
   const piCommand =
-    (launchPrefix ? `${launchPrefix} ` : "") + opts.piArgv.map((arg) => shellEscape(arg)).join(" ");
+    (launchPrefix ? `${launchPrefix} ` : "") +
+    opts.piArgv.map((arg) => shellEscape(arg)).join(" ") +
+    (opts.commandSuffix ? ` ${opts.commandSuffix}` : "");
 
   const scriptLines = [
     "#!/usr/bin/env bash",
@@ -271,8 +290,10 @@ function buildWrapperScript(opts: {
     ...opts.headerLines,
     ...opts.exports,
     `cd ${shellEscape(opts.cwd)}`,
+    ...(opts.commandSuffix ? ["set -o pipefail"] : []),
     piCommand,
     'code=$?',
+    ...(opts.afterCommand ?? []),
     // Stamp the run id so the watcher can decide ownership of this sidecar
     // outright. Resume reuses the session path, so a previous run's wrapper
     // can land its sidecar after ours was cleared; without the id the watcher
@@ -298,12 +319,15 @@ export function buildLaunchPlan(
   agentDefs: AgentDefaults | null,
   ctx: LaunchPlanContext,
 ): LaunchPlan {
-  if (agentDefs?.cli && agentDefs.cli !== "pi") {
+  if (agentDefs?.cli && agentDefs.cli !== "pi" && agentDefs.cli !== "claude") {
     throw new Error(
       `Agent "${params.agent ?? params.name}" uses cli: ${agentDefs.cli}, which is ` +
-        "not supported by pi-herdr-subagents (pi children only).",
+        "not supported by pi-herdr-subagents (pi and claude children only).",
     );
   }
+  // Claude Code children run headless (`claude -p`): one autonomous turn, no
+  // subagent_done/steer/resume, no pi session to fork.
+  const isClaude = agentDefs?.cli === "claude";
 
   const env = ctx.env;
   const now = ctx.now ?? new Date();
@@ -313,8 +337,8 @@ export function buildLaunchPlan(
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
-  const interactive = resolveEffectiveInteractive(params, agentDefs);
-  const autoExit = agentDefs?.autoExit ?? false;
+  const interactive = isClaude ? false : resolveEffectiveInteractive(params, agentDefs);
+  const autoExit = isClaude || (agentDefs?.autoExit ?? false);
 
   const artifactDir = getArtifactDir(ctx.sessionDir, ctx.sessionId);
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(
@@ -333,10 +357,18 @@ export function buildLaunchPlan(
     Math.random().toString(16).slice(2, 10),
     Math.random().toString(16).slice(2, 6),
   ].join("-");
-  const sessionFile = join(childSessionDir, `${sessionTimestamp}_${uuid}.jsonl`);
-
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-  const seedSession = launchBehavior.seededSessionMode
+  if (isClaude && launchBehavior.taskDelivery === "direct") {
+    throw new Error(`Agent "${params.agent ?? params.name}" uses cli: claude, which cannot fork a pi session.`);
+  }
+  // Claude children: the "session file" is the tee'd stream-json output —
+  // watcher summary extraction and sidecars work on it unchanged. It shares
+  // the task artifact's dir, which the executor creates before launch.
+  const sessionFile = isClaude
+    ? join(artifactDir, "context", `${safeName(params.name)}-${id}.claude.jsonl`)
+    : join(childSessionDir, `${sessionTimestamp}_${uuid}.jsonl`);
+
+  const seedSession = launchBehavior.seededSessionMode && !isClaude
     ? {
         mode: launchBehavior.seededSessionMode,
         parentSessionFile: ctx.parentSessionFile,
@@ -364,50 +396,76 @@ export function buildLaunchPlan(
   const artifactTimestamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const name = safeName(params.name);
 
-  // ── pi argv ──
-  const piBin = env.PI_HERDR_PI_BIN ?? (ctx.resolvePiBin ?? defaultResolvePiBin)(env);
-  const piArgv: string[] = [piBin, "--session", sessionFile];
-
-  const subagentDonePath = ctx.subagentDonePath ?? join(PACKAGE_ROOT, "subagent-done.ts");
-  piArgv.push("-e", subagentDonePath);
-
-  if (effectiveModel) {
-    piArgv.push("--model", effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel);
-  }
-
-  // System prompt via file — pi's --system-prompt/--append-system-prompt
-  // auto-detect file paths, avoiding shell escaping issues with multiline content.
+  let piArgv: string[];
   let syspromptFile: string | null = null;
-  if (identityInSystemPrompt && identity) {
-    syspromptFile = join(artifactDir, "context", `${name}-sysprompt-${artifactTimestamp}.md`);
-    files.push({ path: syspromptFile, content: identity });
-    piArgv.push(
-      systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt",
-      syspromptFile,
-    );
-  }
-
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-  if (toolAllowlist) {
-    piArgv.push("--tools", toolAllowlist);
-  }
-
-  // Task delivery: fork inherits the conversation → direct arg; blank-session
-  // modes get the artifact-backed handoff so wrapper instructions arrive as
-  // the initial user message.
   let taskArtifactFile: string | null = null;
-  let taskArg: string;
-  if (launchBehavior.taskDelivery === "direct") {
-    taskArg = fullTask;
-  } else {
+  let commandSuffix: string | undefined;
+  let afterCommand: string[] | undefined;
+  if (isClaude) {
+    // ── claude argv ── headless stream-json, tee'd to the session file for
+    // summary extraction and piped through jq so the pane shows progress.
+    piArgv = [env.PI_HERDR_CLAUDE_BIN ?? "claude", "-p", "--verbose", "--output-format", "stream-json"];
+    if (effectiveModel) piArgv.push("--model", effectiveModel);
+    if (identityInSystemPrompt && identity) {
+      piArgv.push(systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", identity);
+    }
+    if (effectiveTools) piArgv.push("--allowedTools", effectiveTools);
+    // ponytail: whitespace split, no quoting — add a real parser when an arg needs spaces.
+    piArgv.push(...(agentDefs?.cliArgs ?? "").split(/\s+/).filter(Boolean));
+    // Task via stdin: --allowedTools is variadic and would swallow a positional prompt.
     taskArtifactFile = join(artifactDir, "context", `${name}-${artifactTimestamp}.md`);
     files.push({ path: taskArtifactFile, content: fullTask });
-    taskArg = `@${taskArtifactFile}`;
-  }
+    commandSuffix =
+      `< ${shellEscape(taskArtifactFile)} | tee ${shellEscape(sessionFile)} | ` +
+      `jq --unbuffered -rj ${shellEscape(CLAUDE_STREAM_JQ)}`;
+    // No subagent_done in claude — a clean exit is the done signal.
+    afterCommand = [
+      `[ "$code" -eq 0 ] && echo '{"type":"done"}' > ${shellEscape(`${sessionFile}.exit`)}`,
+    ];
+  } else {
+    // ── pi argv ──
+    const piBin = env.PI_HERDR_PI_BIN ?? (ctx.resolvePiBin ?? defaultResolvePiBin)(env);
+    piArgv = [piBin, "--session", sessionFile];
 
-  piArgv.push(
-    ...buildPiPromptArgs({ effectiveSkills, taskDelivery: launchBehavior.taskDelivery, taskArg }),
-  );
+    const subagentDonePath = ctx.subagentDonePath ?? join(PACKAGE_ROOT, "subagent-done.ts");
+    piArgv.push("-e", subagentDonePath);
+
+    if (effectiveModel) {
+      piArgv.push("--model", effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel);
+    }
+
+    // System prompt via file — pi's --system-prompt/--append-system-prompt
+    // auto-detect file paths, avoiding shell escaping issues with multiline content.
+    if (identityInSystemPrompt && identity) {
+      syspromptFile = join(artifactDir, "context", `${name}-sysprompt-${artifactTimestamp}.md`);
+      files.push({ path: syspromptFile, content: identity });
+      piArgv.push(
+        systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt",
+        syspromptFile,
+      );
+    }
+
+    const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+    if (toolAllowlist) {
+      piArgv.push("--tools", toolAllowlist);
+    }
+
+    // Task delivery: fork inherits the conversation → direct arg; blank-session
+    // modes get the artifact-backed handoff so wrapper instructions arrive as
+    // the initial user message.
+    let taskArg: string;
+    if (launchBehavior.taskDelivery === "direct") {
+      taskArg = fullTask;
+    } else {
+      taskArtifactFile = join(artifactDir, "context", `${name}-${artifactTimestamp}.md`);
+      files.push({ path: taskArtifactFile, content: fullTask });
+      taskArg = `@${taskArtifactFile}`;
+    }
+
+    piArgv.push(
+      ...buildPiPromptArgs({ effectiveSkills, taskDelivery: launchBehavior.taskDelivery, taskArg }),
+    );
+  }
 
   // ── Curated env exports (never a full env dump) ──
   const exports: string[] = [];
@@ -445,6 +503,8 @@ export function buildLaunchPlan(
     cwd: targetCwd,
     piArgv,
     sessionFile,
+    commandSuffix,
+    afterCommand,
   });
 
   const launchScriptFile = join(artifactDir, "subagent-scripts", `${name}-${id}.sh`);

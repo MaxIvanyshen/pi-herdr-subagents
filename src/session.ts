@@ -125,7 +125,12 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
 export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
-    if (entry.type !== "message") continue;
+    // Claude Code stream-json (cli: claude children): the result line is the final answer,
+    // and its assistant lines share pi's message/content shape.
+    if (entry.type === "result" && typeof entry.result === "string" && entry.result.trim()) {
+      return entry.result;
+    }
+    if (entry.type !== "message" && entry.type !== "assistant") continue;
     const msg = entry as MessageEntry;
     if (msg.message.role !== "assistant") continue;
 
