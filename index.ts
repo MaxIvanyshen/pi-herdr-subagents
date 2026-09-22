@@ -37,7 +37,7 @@ import {
   type HerdrClient,
 } from "./src/herdr/client.ts";
 import { createHerdrEventStream } from "./src/herdr/events.ts";
-import { driveHerdrAgent, isHerdrAgentSessionFile } from "./src/herdr-agent.ts";
+import { driveHerdrAgent, installedHerdrAgentKinds, isHerdrAgentSessionFile } from "./src/herdr-agent.ts";
 import { consumeContextUsageSidecar, contextUsagePath } from "./src/context-usage.ts";
 import {
   buildLaunchPlan,
@@ -1055,6 +1055,46 @@ const STEER_DESCRIPTION =
   "Send a message into a currently running subagent's active turn (steer), without waiting for it to finish or interrupting it. " +
   "The child picks it up as soon as it's ready \u2014 same mechanism as a human typing into its pane.";
 
+/** What the `subagent` tool's `cli` param can be on this machine, plus agent defs that preset one. */
+export function describeAvailableClis(path?: string): string {
+  const kinds = installedHerdrAgentKinds(path);
+  const presets = discoverAgentDefinitions().filter((def) => def.cli && def.cli !== "pi");
+  return [
+    "Coding agents you can pass as the `subagent` tool's `cli` param:",
+    "- pi (default) — full subagent support: model/tools/skills, fork, resume.",
+    ...kinds.map(
+      (kind) =>
+        `- ${kind} — runs interactively in its own tab and writes you a report; steer/interrupt work, resume/fork don't.`,
+    ),
+    ...(kinds.length ? [] : ["(no other herdr-supported coding agent is installed on PATH)"]),
+    ...(presets.length
+      ? [
+          "",
+          "Agent definitions that preset a non-pi cli (pass as `agent`):",
+          ...presets.map(
+            (def) =>
+              `- ${def.name} — cli: ${def.cli}${def.cliArgs ? ` ${def.cliArgs}` : ""}` +
+              (def.description ? ` — ${def.description}` : ""),
+          ),
+        ]
+      : []),
+  ].join("\n");
+}
+
+function registerClisTool(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "subagent_clis",
+    label: "Subagent CLIs",
+    description:
+      "List the coding agents (pi, claude, codex, …) installed here that the subagent tool can run via its `cli` param, " +
+      "and agent definitions that preset one (e.g. Claude Code with Chrome). Use it before handing work to a non-pi agent.",
+    parameters: Type.Object({}),
+    async execute() {
+      return { content: [{ type: "text" as const, text: describeAvailableClis() }], details: {} };
+    },
+  });
+}
+
 function registerSteerTool(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_steer",
@@ -1293,6 +1333,7 @@ export default function herdrSubagents(pi: ExtensionAPI) {
     if (shouldRegister("subagent_interrupt")) registerInterruptTool(pi);
     if (shouldRegister("subagent_steer")) registerSteerTool(pi);
     if (shouldRegister("subagents_list")) registerListTool(pi);
+    if (shouldRegister("subagent_clis")) registerClisTool(pi);
     registerCommands(pi);
     registeredRealTools = true;
   }
