@@ -44,6 +44,8 @@ export interface SubagentLaunchParams {
   name: string;
   task: string;
   agent?: string;
+  /** Which coding agent runs the task: "pi" (default) or a herdr agent kind. Overrides the agent def's cli. */
+  cli?: string;
   cwd?: string;
   model?: string;
   tools?: string;
@@ -304,7 +306,8 @@ export function buildLaunchPlan(
   // Non-pi children (cli: claude, codex, …) run interactively and are driven
   // through herdr's agent layer (src/herdr-agent.ts): one prompted task turn,
   // no subagent_done/caller_ping, no pi session to fork or resume.
-  const agentKind = agentDefs?.cli && agentDefs.cli !== "pi" ? agentDefs.cli : null;
+  const cli = params.cli ?? agentDefs?.cli ?? "pi";
+  const agentKind = cli !== "pi" ? cli : null;
   if (agentKind && !HERDR_AGENT_KINDS.has(agentKind)) {
     throw new Error(
       `Agent "${params.agent ?? params.name}" uses cli: ${agentKind}, which is ` +
