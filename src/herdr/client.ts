@@ -71,6 +71,14 @@ export interface HerdrClient {
   paneClose(paneId: string): Promise<void>;
   paneSendKeys(paneId: string, keys: string[]): Promise<void>;
   agentPrompt(paneId: string, text: string): Promise<void>;
+  /** Submit a prompt and block until the agent's turn ends (idle/done). */
+  agentPromptAndWait(paneId: string, text: string, signal?: AbortSignal): Promise<void>;
+  /** Block until the agent reaches one of the given states. */
+  agentWait(
+    paneId: string,
+    until: Array<"idle" | "working" | "blocked" | "done" | "unknown">,
+    signal?: AbortSignal,
+  ): Promise<void>;
   ping(): Promise<PingResult>;
   pluginGet(pluginId: string): Promise<PluginInfo | null>;
 }
@@ -283,6 +291,19 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
       // Writes text + Enter as one ordered submission, including while the
       // child's turn is active — this is the actual steer primitive.
       await execHerdr(["agent", "prompt", paneId, text]);
+    },
+
+    async agentPromptAndWait(paneId, text, signal) {
+      // blocked (permission prompts) is deliberately not a match: the user
+      // answers in the pane and the turn continues.
+      await execHerdr(
+        ["agent", "prompt", paneId, text, "--wait", "--until", "idle", "--until", "done"],
+        signal,
+      );
+    },
+
+    async agentWait(paneId, until, signal) {
+      await execHerdr(["agent", "wait", paneId, ...until.flatMap((s) => ["--until", s])], signal);
     },
 
     async ping() {

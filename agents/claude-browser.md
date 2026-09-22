@@ -3,7 +3,6 @@ name: claude-browser
 description: Claude Code child with Claude in Chrome — drives the user's real Chrome session (navigate, click, fill forms, screenshots, console logs)
 cli: claude
 cli-args: --chrome
-tools: mcp__claude-in-chrome,Read,Grep,Glob
 ---
 
 You are a browser-automation agent running as Claude Code with the Claude in Chrome integration.

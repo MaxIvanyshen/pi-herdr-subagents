@@ -1,8 +1,8 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
@@ -15,7 +15,6 @@ import {
   type SubagentLaunchParams,
 } from "../src/launch.ts";
 import type { AgentDefaults } from "../src/agents.ts";
-import { findLastAssistantMessage, getNewEntries } from "../src/session.ts";
 
 interface Fixture {
   root: string;
@@ -401,47 +400,38 @@ describe("launch plan: structure", () => {
   it("rejects unknown CLIs with a clear unsupported error", () => {
     const fx = makeFixture();
     assert.throws(
-      () => plan(fx, { agent: "cx" }, { cli: "codex" }),
+      () => plan(fx, { agent: "cx" }, { cli: "notanagent" }),
       /not supported by pi-herdr-subagents/,
     );
   });
 
-  it("cli: claude runs headless, tees stream-json to the session file, signals done", () => {
+  it("herdr agent kinds launch the interactive CLI and hand the task to the driver", () => {
     const fx = makeFixture();
-    // Fake claude: reads the task from stdin and answers with a stream-json result line.
-    const fakeClaude = join(fx.root, "claude");
-    writeFileSync(
-      fakeClaude,
-      [
-        "#!/usr/bin/env bash",
-        `echo '{"type":"system","subtype":"init"}'`,
-        `grep -q "open chrome" && echo '{"type":"result","subtype":"success","result":"got task"}'`,
-        "",
-      ].join("\n"),
-    );
-    chmodSync(fakeClaude, 0o755);
-    fx.env.PI_HERDR_CLAUDE_BIN = fakeClaude;
     const p = plan(fx, { agent: "cc", task: "open chrome" }, {
-      cli: "claude",
-      tools: "Read,Bash",
-      cliArgs: "--chrome  --permission-mode acceptEdits",
+      cli: "codex",
+      cliArgs: "--model  gpt-5",
+      model: "anthropic/ignored",
+      body: "You are a browser agent.",
+      systemPromptMode: "append",
     });
+    assert.deepEqual(p.piArgv, ["codex", "--model", "gpt-5"]);
     assert.equal(p.autoExit, true);
+    assert.equal(p.interactive, false);
     assert.equal(p.seedSession, null);
-    assert.deepEqual(p.piArgv, [
-      fakeClaude, "-p", "--verbose", "--output-format", "stream-json",
-      "--allowedTools", "Read,Bash", "--chrome", "--permission-mode", "acceptEdits",
-    ]);
+    assert.ok(p.sessionFile.endsWith(".agent.jsonl"));
+    assert.ok(p.herdrAgent);
+    assert.equal(p.herdrAgent.kind, "codex");
+    assert.equal(p.herdrAgent.promptText, `Read ${p.taskArtifactFile} and complete the task it describes.`);
+    const task = p.files.find((f) => f.path === p.taskArtifactFile)!.content;
+    assert.match(task, /You are a browser agent\./);
+    assert.match(task, /open chrome/);
+    assert.ok(task.includes(`write your final report (what you did, what you found) to ${p.herdrAgent.resultFile}`));
+    assert.doesNotMatch(task, /subagent_done/);
+    assert.ok(scriptOf(p).includes("'codex' '--model' 'gpt-5'"));
+  });
 
-    for (const f of p.files) {
-      mkdirSync(dirname(f.path), { recursive: true });
-      writeFileSync(f.path, f.content);
-    }
-    execFileSync("bash", [p.launchScriptFile], { stdio: "ignore" });
-
-    assert.equal(readFileSync(`${p.sessionFile}.exitcode`, "utf8").trim(), `0 ${p.id}`);
-    assert.deepEqual(JSON.parse(readFileSync(`${p.sessionFile}.exit`, "utf8")), { type: "done" });
-    assert.equal(findLastAssistantMessage(getNewEntries(p.sessionFile, 0)), "got task");
+  it("pi children carry no herdr agent driver", () => {
+    assert.equal(plan(makeFixture()).herdrAgent, null);
   });
 
   it("cli: claude refuses fork mode", () => {
