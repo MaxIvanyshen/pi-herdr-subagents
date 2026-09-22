@@ -51,9 +51,14 @@ surface area, this extension targets herdr only and uses its native primitives d
   the running version and plugin state at session start.
 - **pi running inside a herdr pane.** herdr injects `HERDR_ENV`, `HERDR_PANE_ID`, and
   `HERDR_SOCKET_PATH` into every pane; the extension activates only when they are present.
-- **pi children only.** Claude Code / codex subagents are an explicit non-goal — if you need
-  them, use [pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents).
-  Agent defs with `cli: claude` produce a clear "unsupported" error.
+- **pi children, plus headless Claude Code children.** Agent defs with `cli: claude` run
+  `claude -p --output-format stream-json` in the herdr pane (rendered through `jq`, so `jq` must
+  be on PATH). Use them for things only Claude Code does well, e.g. Claude in Chrome — see
+  [`agents/claude-browser.md`](agents/claude-browser.md). `tools:` maps to `--allowedTools`,
+  `model:` to `--model`, `system-prompt:` to `--(append-)system-prompt`, and `cli-args:` is
+  appended verbatim (whitespace-split). Claude children always run one autonomous turn: no
+  `subagent_done`/`caller_ping`, `subagent_steer`, `subagent_resume`, or `fork` mode. Other CLIs
+  (codex, …) produce a clear "unsupported" error.
 - node ≥ 22.
 
 ## Setup
@@ -273,7 +278,8 @@ eternal "stalled" zombie** — every row below terminates the running entry with
   name/agent/elapsed/count list.
 - **Distinct user-exit phrasing.** A user quitting a child without `subagent_done` is reported
   as exactly that, not as a generic completion.
-- **pi children only.** No Claude Code CLI path, no transcript-copy machinery.
+- **Claude children are headless.** `claude -p` stream-json is tee'd to the child's session
+  file, so no transcript-copy machinery.
 - **Panes auto-close** on clean exit (held open only for startup crashes).
 - **herdr only.** No cmux/tmux/zellij/wezterm code paths.
 

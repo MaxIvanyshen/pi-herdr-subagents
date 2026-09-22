@@ -41,6 +41,7 @@ import { consumeContextUsageSidecar, contextUsagePath } from "./src/context-usag
 import {
   buildLaunchPlan,
   buildResumeLaunchPlan,
+  isClaudeSessionFile,
   resolveResumeLaunchBehavior,
 } from "./src/launch.ts";
 import {
@@ -743,6 +744,12 @@ async function executeSubagentResume(
       "session not found",
     );
   }
+  if (isClaudeSessionFile(params.sessionPath)) {
+    return errorResult(
+      "Error: Claude Code subagents cannot be resumed — spawn a new one with the follow-up task.",
+      "claude not resumable",
+    );
+  }
 
   let setupError: string | null;
   try {
@@ -997,6 +1004,10 @@ async function handleSubagentSteer(params: { id?: string; name?: string; message
   }
 
   const running = resolved.running;
+  if (isClaudeSessionFile(running.sessionFile)) {
+    const error = `Subagent "${running.name}" is a headless Claude Code run and cannot be steered.`;
+    return errorResult(error, error);
+  }
   try {
     await deps.client.agentPrompt(running.paneId, params.message);
   } catch (error: any) {

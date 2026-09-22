@@ -1,8 +1,8 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
@@ -15,6 +15,7 @@ import {
   type SubagentLaunchParams,
 } from "../src/launch.ts";
 import type { AgentDefaults } from "../src/agents.ts";
+import { findLastAssistantMessage, getNewEntries } from "../src/session.ts";
 
 interface Fixture {
   root: string;
@@ -397,12 +398,55 @@ describe("launch plan: structure", () => {
     assert.ok(p.sessionFile.includes(join(fx.agentDir, "sessions")));
   });
 
-  it("rejects cli: claude with a clear unsupported error", () => {
+  it("rejects unknown CLIs with a clear unsupported error", () => {
     const fx = makeFixture();
     assert.throws(
-      () => plan(fx, { agent: "cc" }, { cli: "claude" }),
+      () => plan(fx, { agent: "cx" }, { cli: "codex" }),
       /not supported by pi-herdr-subagents/,
     );
+  });
+
+  it("cli: claude runs headless, tees stream-json to the session file, signals done", () => {
+    const fx = makeFixture();
+    // Fake claude: reads the task from stdin and answers with a stream-json result line.
+    const fakeClaude = join(fx.root, "claude");
+    writeFileSync(
+      fakeClaude,
+      [
+        "#!/usr/bin/env bash",
+        `echo '{"type":"system","subtype":"init"}'`,
+        `grep -q "open chrome" && echo '{"type":"result","subtype":"success","result":"got task"}'`,
+        "",
+      ].join("\n"),
+    );
+    chmodSync(fakeClaude, 0o755);
+    fx.env.PI_HERDR_CLAUDE_BIN = fakeClaude;
+    const p = plan(fx, { agent: "cc", task: "open chrome" }, {
+      cli: "claude",
+      tools: "Read,Bash",
+      cliArgs: "--chrome  --permission-mode acceptEdits",
+    });
+    assert.equal(p.autoExit, true);
+    assert.equal(p.seedSession, null);
+    assert.deepEqual(p.piArgv, [
+      fakeClaude, "-p", "--verbose", "--output-format", "stream-json",
+      "--allowedTools", "Read,Bash", "--chrome", "--permission-mode", "acceptEdits",
+    ]);
+
+    for (const f of p.files) {
+      mkdirSync(dirname(f.path), { recursive: true });
+      writeFileSync(f.path, f.content);
+    }
+    execFileSync("bash", [p.launchScriptFile], { stdio: "ignore" });
+
+    assert.equal(readFileSync(`${p.sessionFile}.exitcode`, "utf8").trim(), `0 ${p.id}`);
+    assert.deepEqual(JSON.parse(readFileSync(`${p.sessionFile}.exit`, "utf8")), { type: "done" });
+    assert.equal(findLastAssistantMessage(getNewEntries(p.sessionFile, 0)), "got task");
+  });
+
+  it("cli: claude refuses fork mode", () => {
+    const fx = makeFixture();
+    assert.throws(() => plan(fx, { agent: "cc", fork: true }, { cli: "claude" }), /cannot fork/);
   });
 
   it("generated script passes bash -n", () => {
