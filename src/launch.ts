@@ -37,6 +37,7 @@ import {
   resolveLaunchBehavior,
   resolveSubagentPaths,
 } from "./agents.ts";
+import { HERDR_AGENT_KINDS, HERDR_AGENT_SESSION_SUFFIX } from "./herdr-agent.ts";
 
 /** `subagent` tool params consulted by launch planning. */
 export interface SubagentLaunchParams {
@@ -102,8 +103,10 @@ export interface LaunchPlan {
     direction?: "right" | "down";
     launchScriptFile: string;
   };
-  /** The unescaped pi invocation embedded in the wrapper script (piArgv[0] = binary). */
+  /** The unescaped child invocation embedded in the wrapper script (piArgv[0] = binary). */
   piArgv: string[];
+  /** Set for non-pi children: what the herdr agent driver needs after the pane starts. */
+  herdrAgent: { kind: string; promptText: string; resultFile: string } | null;
   interactive: boolean;
   autoExit: boolean;
   /** Startup crash hold-open window in seconds (0 = disabled). */
@@ -114,19 +117,6 @@ export interface LaunchPlan {
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const DEFAULT_HOLD_OPEN_SECS = 15;
-
-/** Renders claude stream-json as readable pane output: text, tool calls, final status. */
-const CLAUDE_STREAM_JQ =
-  'if .type == "assistant" then (.message.content[] | ' +
-  'if .type == "text" then .text + "\\n\\n" ' +
-  'elif .type == "tool_use" then "→ \\(.name) \\(.input | tostring | .[0:160])\\n" ' +
-  'else empty end) ' +
-  'elif .type == "result" then "\\n[claude \\(.subtype)]\\n" else empty end';
-
-/** Claude children's session file is claude stream-json, not a resumable/steerable pi session. */
-export function isClaudeSessionFile(sessionFile: string): boolean {
-  return sessionFile.endsWith(".claude.jsonl");
-}
 
 /** Ported from pi-interactive-subagents cmux.ts — the only thing taken from cmux.ts. */
 export function shellEscape(s: string): string {
@@ -270,17 +260,11 @@ function buildWrapperScript(opts: {
   cwd: string;
   piArgv: string[];
   sessionFile: string;
-  /** Raw shell appended to the command (e.g. `< task | tee …`); enables pipefail. */
-  commandSuffix?: string;
-  /** Raw shell lines run after `code=$?`, before the exitcode sidecar. */
-  afterCommand?: string[];
 }): { content: string; holdOpenSecs: number } {
   const launchPrefix = resolveLaunchPrefix(opts.env, opts.cwd);
   const holdOpenSecs = resolveHoldOpenSecs(opts.env);
   const piCommand =
-    (launchPrefix ? `${launchPrefix} ` : "") +
-    opts.piArgv.map((arg) => shellEscape(arg)).join(" ") +
-    (opts.commandSuffix ? ` ${opts.commandSuffix}` : "");
+    (launchPrefix ? `${launchPrefix} ` : "") + opts.piArgv.map((arg) => shellEscape(arg)).join(" ");
 
   const scriptLines = [
     "#!/usr/bin/env bash",
@@ -290,10 +274,8 @@ function buildWrapperScript(opts: {
     ...opts.headerLines,
     ...opts.exports,
     `cd ${shellEscape(opts.cwd)}`,
-    ...(opts.commandSuffix ? ["set -o pipefail"] : []),
     piCommand,
     'code=$?',
-    ...(opts.afterCommand ?? []),
     // Stamp the run id so the watcher can decide ownership of this sidecar
     // outright. Resume reuses the session path, so a previous run's wrapper
     // can land its sidecar after ours was cleared; without the id the watcher
@@ -319,15 +301,16 @@ export function buildLaunchPlan(
   agentDefs: AgentDefaults | null,
   ctx: LaunchPlanContext,
 ): LaunchPlan {
-  if (agentDefs?.cli && agentDefs.cli !== "pi" && agentDefs.cli !== "claude") {
+  // Non-pi children (cli: claude, codex, …) run interactively and are driven
+  // through herdr's agent layer (src/herdr-agent.ts): one prompted task turn,
+  // no subagent_done/caller_ping, no pi session to fork or resume.
+  const agentKind = agentDefs?.cli && agentDefs.cli !== "pi" ? agentDefs.cli : null;
+  if (agentKind && !HERDR_AGENT_KINDS.has(agentKind)) {
     throw new Error(
-      `Agent "${params.agent ?? params.name}" uses cli: ${agentDefs.cli}, which is ` +
-        "not supported by pi-herdr-subagents (pi and claude children only).",
+      `Agent "${params.agent ?? params.name}" uses cli: ${agentKind}, which is ` +
+        `not supported by pi-herdr-subagents (pi, or a herdr agent kind: ${[...HERDR_AGENT_KINDS].join(", ")}).`,
     );
   }
-  // Claude Code children run headless (`claude -p`): one autonomous turn, no
-  // subagent_done/steer/resume, no pi session to fork.
-  const isClaude = agentDefs?.cli === "claude";
 
   const env = ctx.env;
   const now = ctx.now ?? new Date();
@@ -337,8 +320,8 @@ export function buildLaunchPlan(
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
-  const interactive = isClaude ? false : resolveEffectiveInteractive(params, agentDefs);
-  const autoExit = isClaude || (agentDefs?.autoExit ?? false);
+  const interactive = agentKind ? false : resolveEffectiveInteractive(params, agentDefs);
+  const autoExit = agentDefs?.autoExit ?? Boolean(agentKind);
 
   const artifactDir = getArtifactDir(ctx.sessionDir, ctx.sessionId);
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(
@@ -358,17 +341,17 @@ export function buildLaunchPlan(
     Math.random().toString(16).slice(2, 6),
   ].join("-");
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-  if (isClaude && launchBehavior.taskDelivery === "direct") {
-    throw new Error(`Agent "${params.agent ?? params.name}" uses cli: claude, which cannot fork a pi session.`);
+  if (agentKind && launchBehavior.taskDelivery === "direct") {
+    throw new Error(`Agent "${params.agent ?? params.name}" uses cli: ${agentKind}, which cannot fork a pi session.`);
   }
-  // Claude children: the "session file" is the tee'd stream-json output —
-  // watcher summary extraction and sidecars work on it unchanged. It shares
-  // the task artifact's dir, which the executor creates before launch.
-  const sessionFile = isClaude
-    ? join(artifactDir, "context", `${safeName(params.name)}-${id}.claude.jsonl`)
+  // herdr-driven agents: the "session file" only receives the driver's result
+  // line, so the watcher's sidecars and summary extraction work unchanged. It
+  // shares the task artifact's dir, which the executor creates before launch.
+  const sessionFile = agentKind
+    ? join(artifactDir, "context", `${safeName(params.name)}-${id}${HERDR_AGENT_SESSION_SUFFIX}`)
     : join(childSessionDir, `${sessionTimestamp}_${uuid}.jsonl`);
 
-  const seedSession = launchBehavior.seededSessionMode && !isClaude
+  const seedSession = launchBehavior.seededSessionMode && !agentKind
     ? {
         mode: launchBehavior.seededSessionMode,
         parentSessionFile: ctx.parentSessionFile,
@@ -378,15 +361,20 @@ export function buildLaunchPlan(
     : null;
 
   // ── Task message (wrapper instructions only for blank-session modes) ──
-  const modeHint = autoExit
+  const modeHint = autoExit || agentKind
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = autoExit
+  const resultFile = agentKind
+    ? join(artifactDir, "context", `${safeName(params.name)}-${id}.result.md`)
+    : null;
+  const summaryInstruction = resultFile
+    ? `When finished, write your final report (what you did, what you found) to ${resultFile}, then stop.`
+    : autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
-  const identityInSystemPrompt = Boolean(systemPromptMode && identity);
+  const identityInSystemPrompt = Boolean(systemPromptMode && identity && !agentKind);
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const fullTask = launchBehavior.inheritsConversationContext
     ? params.task
@@ -399,29 +387,21 @@ export function buildLaunchPlan(
   let piArgv: string[];
   let syspromptFile: string | null = null;
   let taskArtifactFile: string | null = null;
-  let commandSuffix: string | undefined;
-  let afterCommand: string[] | undefined;
-  if (isClaude) {
-    // ── claude argv ── headless stream-json, tee'd to the session file for
-    // summary extraction and piped through jq so the pane shows progress.
-    piArgv = [env.PI_HERDR_CLAUDE_BIN ?? "claude", "-p", "--verbose", "--output-format", "stream-json"];
-    if (effectiveModel) piArgv.push("--model", effectiveModel);
-    if (identityInSystemPrompt && identity) {
-      piArgv.push(systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", identity);
-    }
-    if (effectiveTools) piArgv.push("--allowedTools", effectiveTools);
-    // ponytail: whitespace split, no quoting — add a real parser when an arg needs spaces.
-    piArgv.push(...(agentDefs?.cliArgs ?? "").split(/\s+/).filter(Boolean));
-    // Task via stdin: --allowedTools is variadic and would swallow a positional prompt.
+  let herdrAgent: LaunchPlan["herdrAgent"] = null;
+  if (agentKind) {
+    // ── herdr agent argv ── the interactive TUI itself; model, tools etc. are
+    // agent-specific flags, so they come from cli-args, not pi's fields.
+    // ponytail: binary = kind name and whitespace-split args; add cli-bin /
+    // quoting when an agent (e.g. cursor → cursor-agent) needs it.
+    piArgv = [agentKind, ...(agentDefs?.cliArgs ?? "").split(/\s+/).filter(Boolean)];
     taskArtifactFile = join(artifactDir, "context", `${name}-${artifactTimestamp}.md`);
     files.push({ path: taskArtifactFile, content: fullTask });
-    commandSuffix =
-      `< ${shellEscape(taskArtifactFile)} | tee ${shellEscape(sessionFile)} | ` +
-      `jq --unbuffered -rj ${shellEscape(CLAUDE_STREAM_JQ)}`;
-    // No subagent_done in claude — a clean exit is the done signal.
-    afterCommand = [
-      `[ "$code" -eq 0 ] && echo '{"type":"done"}' > ${shellEscape(`${sessionFile}.exit`)}`,
-    ];
+    herdrAgent = {
+      kind: agentKind,
+      // One line: multi-line text would be submitted early by some TUIs.
+      promptText: `Read ${taskArtifactFile} and complete the task it describes.`,
+      resultFile: resultFile!,
+    };
   } else {
     // ── pi argv ──
     const piBin = env.PI_HERDR_PI_BIN ?? (ctx.resolvePiBin ?? defaultResolvePiBin)(env);
@@ -503,8 +483,6 @@ export function buildLaunchPlan(
     cwd: targetCwd,
     piArgv,
     sessionFile,
-    commandSuffix,
-    afterCommand,
   });
 
   const launchScriptFile = join(artifactDir, "subagent-scripts", `${name}-${id}.sh`);
@@ -530,6 +508,7 @@ export function buildLaunchPlan(
       launchScriptFile,
     },
     piArgv,
+    herdrAgent,
     interactive,
     autoExit,
     holdOpenSecs,

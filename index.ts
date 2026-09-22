@@ -37,11 +37,11 @@ import {
   type HerdrClient,
 } from "./src/herdr/client.ts";
 import { createHerdrEventStream } from "./src/herdr/events.ts";
+import { driveHerdrAgent, isHerdrAgentSessionFile } from "./src/herdr-agent.ts";
 import { consumeContextUsageSidecar, contextUsagePath } from "./src/context-usage.ts";
 import {
   buildLaunchPlan,
   buildResumeLaunchPlan,
-  isClaudeSessionFile,
   resolveResumeLaunchBehavior,
 } from "./src/launch.ts";
 import {
@@ -394,6 +394,9 @@ function armWatcher(
     })
     .finally(() => {
       moduleSignal.removeEventListener("abort", onModuleAbort);
+      // Stops a herdr agent driver (and its `agent prompt --wait` child) once
+      // the run is settled, e.g. launch-failed while the driver still polls.
+      watcherAbort.abort();
     });
 }
 
@@ -584,6 +587,23 @@ async function executeSubagentSpawn(
     autoExit: plan.autoExit,
   };
   armWatcher(pi, running);
+  if (plan.herdrAgent) {
+    void driveHerdrAgent(
+      {
+        ...plan.herdrAgent,
+        id: plan.id,
+        paneId: started.paneId,
+        sessionFile: plan.sessionFile,
+        autoExit: plan.autoExit,
+        takeInterrupt: () => {
+          const pending = running.interruptPending === true;
+          running.interruptPending = false;
+          return pending;
+        },
+      },
+      { client: deps.client, signal: running.abortController!.signal },
+    );
+  }
 
   return {
     content: [
@@ -744,10 +764,10 @@ async function executeSubagentResume(
       "session not found",
     );
   }
-  if (isClaudeSessionFile(params.sessionPath)) {
+  if (isHerdrAgentSessionFile(params.sessionPath)) {
     return errorResult(
-      "Error: Claude Code subagents cannot be resumed — spawn a new one with the follow-up task.",
-      "claude not resumable",
+      "Error: non-pi subagents (claude, codex, …) cannot be resumed — spawn a new one with the follow-up task.",
+      "agent not resumable",
     );
   }
 
@@ -928,6 +948,7 @@ async function handleSubagentInterrupt(params: { id?: string; name?: string }) {
   try {
     // "esc" is herdr key-combo syntax (src/input/parse.rs maps it to KeyCode::Esc).
     await deps.client.paneSendKeys(running.paneId, ["esc"]);
+    running.interruptPending = true;
   } catch (error: any) {
     const message =
       `Failed to send Escape to subagent "${running.name}" via herdr: ` +
@@ -1004,10 +1025,6 @@ async function handleSubagentSteer(params: { id?: string; name?: string; message
   }
 
   const running = resolved.running;
-  if (isClaudeSessionFile(running.sessionFile)) {
-    const error = `Subagent "${running.name}" is a headless Claude Code run and cannot be steered.`;
-    return errorResult(error, error);
-  }
   try {
     await deps.client.agentPrompt(running.paneId, params.message);
   } catch (error: any) {
