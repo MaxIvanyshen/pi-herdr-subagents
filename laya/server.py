@@ -48,6 +48,27 @@ def load(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
 
 
+def msg_text(m: dict) -> str:
+    c = m.get("content")
+    return c if isinstance(c, str) else "\n".join(x["text"] for x in c or [] if x.get("type") == "text").strip()
+
+
+def last_turn(msgs: list[dict], end: int) -> str:
+    """Tool outcomes of the turn ending at msgs[end], in words (Laya/Jev can't compare numbers)."""
+    results = []
+    for m in reversed(msgs[:end]):
+        if m.get("role") == "user":
+            break
+        if m.get("role") == "toolResult":
+            results.insert(0, m)
+    if not results:
+        return "The final turn used no tools."
+    failed = sum(bool(r.get("isError")) for r in results)
+    last = results[-1]
+    return (f"The final turn ran {len(results)} tool calls and {failed or 'none'} failed. "
+            f"The last tool call ({last.get('toolName')}) {'failed' if last.get('isError') else 'succeeded'}.")
+
+
 def replay(root: Path) -> list[dict]:
     """Past subagent sessions: a reply that ended the session (or called subagent_done) was done;
     a caller_ping was a question. A user reply after a report is NOT counted as needs-input —
@@ -58,10 +79,11 @@ def replay(root: Path) -> list[dict]:
         if not lines or "parentSession" not in lines[0]:
             continue  # only subagent sessions
         msgs = [e["message"] for e in map(json.loads, lines) if e.get("type") == "message"]
+        task = next((msg_text(m) for m in msgs if m.get("role") == "user"), "")
         for i, m in enumerate(msgs):
             if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
                 continue
-            text = "\n".join(c["text"] for c in m["content"] if c.get("type") == "text").strip()
+            text = msg_text(m)
             calls = {c.get("name"): c for c in m["content"] if c.get("type") == "toolCall"}
             if "caller_ping" in calls:
                 text, done = calls["caller_ping"]["arguments"].get("message", ""), False
@@ -70,7 +92,7 @@ def replay(root: Path) -> list[dict]:
             else:
                 continue
             if text:
-                out.append({"text": text, "done": done, "src": "replay"})
+                out.append({"task": task, "last_turn": last_turn(msgs, i), "text": text, "done": done, "src": "replay"})
     return out
 
 
@@ -83,26 +105,12 @@ def fit(scored: list[tuple[float, bool]]) -> float:
     return min(cands, key=cost)
 
 
-examples = load(SEEDS) + load(LABELS) + replay(SESSIONS)
-scored = [(p_done(e["text"]), e["done"]) for e in examples]
-
-if "--eval" in sys.argv:
-    idx = list(range(len(scored)))
+def split(n: int) -> tuple[list[int], list[int]]:
+    """Fixed 70/30 train/test split of indices, same for every run and every model."""
+    idx = list(range(n))
     random.Random(0).shuffle(idx)
-    cut = int(len(idx) * 0.7)
-    t = fit([scored[i] for i in idx[:cut]])
-    test = [(scored[i], examples[i]) for i in idx[cut:]]
-    done = [(p, e) for (p, d), e in test if d]
-    need = [(p, e) for (p, d), e in test if not d]
-    print(f"train={cut} test={len(test)} (done={len(done)} needs-input={len(need)}) threshold={t:.3f}")
-    print(f"  done kept open (bad, stalls parent): {sum(p < t for p, _ in done)}/{len(done)}")
-    print(f"  needs-input exited (cheap, resumable): {sum(p >= t for p, _ in need)}/{len(need)}")
-    for p, e in sorted(done + need, key=lambda x: x[0]):
-        if (p >= t) != e["done"]:
-            print(f"  miss p={p:.3f} {'done' if e['done'] else 'needs-input'}: {e['text'][-100:]!r}")
-    sys.exit(0)
-
-threshold = fit(scored)
+    cut = int(n * 0.7)
+    return idx[:cut], idx[cut:]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -132,5 +140,24 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-print(f"laya sidecar on 127.0.0.1:{PORT} threshold={threshold:.3f} (n={len(scored)})", flush=True)
-HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+if __name__ == "__main__":
+    examples = load(SEEDS) + load(LABELS) + replay(SESSIONS)
+    scored = [(p_done(e["text"]), e["done"]) for e in examples]
+
+    if "--eval" in sys.argv:
+        train, test_idx = split(len(scored))
+        t = fit([scored[i] for i in train])
+        test = [(scored[i], examples[i]) for i in test_idx]
+        done = [(p, e) for (p, d), e in test if d]
+        need = [(p, e) for (p, d), e in test if not d]
+        print(f"train={len(train)} test={len(test)} (done={len(done)} needs-input={len(need)}) threshold={t:.3f}")
+        print(f"  done kept open (bad, stalls parent): {sum(p < t for p, _ in done)}/{len(done)}")
+        print(f"  needs-input exited (cheap, resumable): {sum(p >= t for p, _ in need)}/{len(need)}")
+        for p, e in sorted(done + need, key=lambda x: x[0]):
+            if (p >= t) != e["done"]:
+                print(f"  miss p={p:.3f} {'done' if e['done'] else 'needs-input'}: {e['text'][-100:]!r}")
+        sys.exit(0)
+
+    threshold = fit(scored)
+    print(f"laya sidecar on 127.0.0.1:{PORT} threshold={threshold:.3f} (n={len(scored)})", flush=True)
+    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
