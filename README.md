@@ -51,7 +51,8 @@ surface area, this extension targets herdr only and uses its native primitives d
   the running version and plugin state at session start.
 - **pi running inside a herdr pane.** herdr injects `HERDR_ENV`, `HERDR_PANE_ID`, and
   `HERDR_SOCKET_PATH` into every pane; the extension activates only when they are present.
-- **pi children, plus any coding agent herdr detects.** Agent defs with `cli: <kind>` —
+- **pi children, plus any coding agent herdr detects.** The `subagent` tool's optional `cli`
+  parameter (default `pi`), or an agent def's `cli: <kind>` frontmatter, picks the agent —
   `claude`, `codex`, `gemini`, `opencode`, `amp`, `cursor`, … (every kind `herdr agent start
   --help` lists) — run that agent's interactive TUI in the herdr pane and drive it through herdr's
   agent layer: wait until herdr reports it idle, `herdr agent prompt --wait` a one-line pointer to

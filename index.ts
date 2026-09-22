@@ -414,6 +414,15 @@ const SubagentParams = Type.Object({
         "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
     }),
   ),
+  cli: Type.Optional(
+    Type.String({
+      description:
+        "Which coding agent runs the task. Default 'pi'. Use another agent for what it does better, " +
+        "e.g. 'claude' (Claude Code: Claude in Chrome browser automation), 'codex', 'gemini', 'opencode' — " +
+        "any agent herdr detects. It runs interactively in its own tab and writes a report back to you; " +
+        "model/tools/skills don't apply to non-pi agents. Overrides the agent definition's cli.",
+    }),
+  ),
   systemPrompt: Type.Optional(
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),

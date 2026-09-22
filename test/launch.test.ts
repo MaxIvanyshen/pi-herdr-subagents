@@ -434,6 +434,17 @@ describe("launch plan: structure", () => {
     assert.equal(plan(makeFixture()).herdrAgent, null);
   });
 
+  it("the cli tool param picks the agent without an agent def, and overrides the def's cli", () => {
+    const fx = makeFixture();
+    const direct = plan(fx, { cli: "claude" });
+    assert.deepEqual(direct.piArgv, ["claude"]);
+    assert.equal(direct.herdrAgent?.kind, "claude");
+
+    const backToPi = plan(fx, { cli: "pi" }, { cli: "claude" });
+    assert.equal(backToPi.herdrAgent, null);
+    assert.equal(backToPi.piArgv[0], fx.piBin);
+  });
+
   it("cli: claude refuses fork mode", () => {
     const fx = makeFixture();
     assert.throws(() => plan(fx, { agent: "cc", fork: true }, { cli: "claude" }), /cannot fork/);
