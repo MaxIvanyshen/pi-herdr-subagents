@@ -18,10 +18,11 @@
  * pi-extension/subagents/index.ts @ fix/launch-verify-retry, adapted for herdr
  * (argv launch via src/launch.ts + herdr client, no mux/screen-scrape code).
  */
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Input, Text, truncateToWidth as fitToWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +50,16 @@ import {
   renderSubagentResult,
 } from "./src/messages.ts";
 import { markSubagentActive, markSubagentInactive } from "./src/runtime-state.ts";
+import {
+  checkJevKey,
+  DECIDER_MODES,
+  type DeciderMode,
+  jevKeyFile,
+  readDeciderMode,
+  savedJevKey,
+  saveJevKey,
+  writeDeciderMode,
+} from "./src/idle-decider.ts";
 import {
   findLastAssistantMessage,
   getNewEntries,
@@ -1191,6 +1202,98 @@ function registerCommands(pi: ExtensionAPI): void {
       );
     },
   });
+
+  // /subagent-decider — who decides whether an idle subagent exits (src/idle-decider.ts)
+  const deciderHelp: Record<DeciderMode, string> = {
+    jev: "TypeSafe Jev (sends brief + final reply to api.typesafe.ai)",
+    off: "no classifier, nothing leaves the machine; the auto-exit flag decides",
+  };
+  const deciderArgs = [
+    ...DECIDER_MODES.map((m) => ({ value: m, label: m, description: deciderHelp[m] })),
+    { value: "key", label: "key", description: "save your TypeSafe API key (masked prompt, verified)" },
+  ];
+  pi.registerCommand("subagent-decider", {
+    description: "Idle subagent exit decider: /subagent-decider [jev|off|key]",
+    getArgumentCompletions: (prefix) => {
+      const options = deciderArgs.filter(({ value }) => value.startsWith(prefix));
+      return options.length > 0 ? options : null;
+    },
+    handler: async (args, ctx) => {
+      const arg = args.trim();
+      if (arg === "key") return saveKeyInteractively(ctx);
+      if (arg) {
+        if (!(DECIDER_MODES as string[]).includes(arg)) {
+          ctx.ui.notify("Usage: /subagent-decider [jev|off|key]", "error");
+          return;
+        }
+        writeDeciderMode(arg as DeciderMode);
+      }
+      const current = readDeciderMode();
+      // Children get a curated env (src/launch.ts), so this pane's env vars don't
+      // reach them; the saved key file is what they can rely on.
+      const saved = savedJevKey();
+      const keyNote =
+        current !== "jev"
+          ? ""
+          : saved
+            ? ` · key …${saved.slice(-4)}`
+            : " · no key saved, so subagents use the auto-exit flag. Run /subagent-decider key";
+      ctx.ui.notify(`Subagent decider: ${current} (${deciderHelp[current]})${keyNote}`, saved || current !== "jev" ? "info" : "warning");
+    },
+  });
+
+  /** pi's ui.input echoes what you type; this edits with the same Input but draws dots. */
+  function promptSecret(ctx: ExtensionCommandContext, title: string, hints: string[]): Promise<string | undefined> {
+    return ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+      const input = new Input();
+      input.onSubmit = (value) => done(value.trim() || undefined);
+      input.onEscape = () => done(undefined);
+      return {
+        render: (width: number) => {
+          const n = input.getValue().length;
+          return [
+            theme.fg("accent", theme.bold(title)),
+            n ? `  ${"•".repeat(Math.min(n, 32))}${theme.fg("dim", `  ${n} chars`)}` : theme.fg("dim", "  paste your key"),
+            ...hints.map((hint) => theme.fg("muted", `  ${hint}`)),
+          ].map((line) => fitToWidth(line, width));
+        },
+        invalidate: () => input.invalidate(),
+        handleInput: (data: string) => {
+          input.handleInput(data);
+          tui.requestRender();
+        },
+      };
+    });
+  }
+
+  async function saveKeyInteractively(ctx: ExtensionCommandContext): Promise<void> {
+    if (ctx.mode !== "tui") {
+      ctx.ui.notify("/subagent-decider key needs the interactive TUI", "error");
+      return;
+    }
+    const key = await promptSecret(
+      ctx,
+      "TypeSafe API key for the subagent idle decider",
+      ["Enter saves · Esc cancels", `Stored in ${jevKeyFile().replace(homedir(), "~")}, readable only by you`],
+    );
+    if (!key) {
+      ctx.ui.notify("No key saved.", "info");
+      return;
+    }
+    ctx.ui.notify("Checking the key with TypeSafe…", "info");
+    const check = await checkJevKey(key);
+    if (check === "rejected") {
+      ctx.ui.notify("TypeSafe rejected that key. Nothing saved.", "error");
+      return;
+    }
+    saveJevKey(key);
+    ctx.ui.notify(
+      check === "ok"
+        ? `✓ Key …${key.slice(-4)} verified and saved. Subagents use it from their next decision.`
+        : `Key …${key.slice(-4)} saved, but TypeSafe couldn't be reached to verify it.`,
+      check === "ok" ? "info" : "warning",
+    );
+  }
 
   // /iterate — fork the session into a subagent
   pi.registerCommand("iterate", {
