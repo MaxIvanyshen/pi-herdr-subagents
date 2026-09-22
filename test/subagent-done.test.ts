@@ -12,6 +12,7 @@ import {
   writeExitSidecar,
 } from "../subagent-done.ts";
 import { writeContextUsageSidecar } from "../src/context-usage.ts";
+import { writeDeciderMode } from "../src/idle-decider.ts";
 import {
   clearActiveSubagents,
   markSubagentActive,
@@ -547,7 +548,15 @@ describe("subagent-done: Laya decides exit vs keep-open", () => {
   async function launch(env: Record<string, string>) {
     const dir = mkdtempSync(join(tmpdir(), "herdr-done-"));
     const sessionFile = join(dir, "child.jsonl");
-    const all = { PI_SUBAGENT_SESSION: sessionFile, PI_SUBAGENT_AUTO_EXIT: "0", ...env };
+    // Isolated HOME (decider mode + key files) and no real TypeSafe key from the dev shell.
+    const all = {
+      PI_SUBAGENT_SESSION: sessionFile,
+      PI_SUBAGENT_AUTO_EXIT: "0",
+      HOME: dir,
+      TYPESAFE_API_KEY: "",
+      JEV_API_KEY: "",
+      ...env,
+    };
     const orig = Object.fromEntries(Object.keys(all).map((k) => [k, process.env[k]]));
     Object.assign(process.env, all);
     cleanups.push(() => {
@@ -647,6 +656,71 @@ describe("subagent-done: Laya decides exit vs keep-open", () => {
     handlers.input({}, ctx);
     await new Promise((r) => setTimeout(r, 120));
     assert.equal(state.shutdown, false);
+  });
+
+  it("mode off consults no classifier", async () => {
+    const laya = await fakeLaya(true);
+    const { handlers, ctx, state } = await launch({ PI_LAYA_URL: laya.url });
+    writeDeciderMode("off");
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(state.shutdown, false, "interactive + no classifier stays open");
+  });
+
+  // Fake api.typesafe.ai: answers p(finished), records request bodies.
+  async function fakeJev(finished: number, status = 200) {
+    const bodies: any[] = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        bodies.push(JSON.parse(body));
+        res.statusCode = status;
+        res.end(JSON.stringify({ answers: { q: { probabilities: { finished } } } }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    cleanups.push(() => server.close());
+    return { url: `http://127.0.0.1:${(server.address() as any).port}`, bodies };
+  }
+
+  it("jev mode sends brief + reply + last turn and acts on the answer", async () => {
+    const jev = await fakeJev(0.9);
+    const { handlers, ctx, state } = await launch({ PI_JEV_URL: jev.url, TYPESAFE_API_KEY: "k" });
+    // Resumed session: this run's event only has the resume prompt; the brief is
+    // in the session, as it is in the replayed training data.
+    const session = [
+      { role: "user", content: [{ type: "text", text: "Write the report. " }] },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "draft" }] },
+      { role: "user", content: [{ type: "text", text: "continue" }] },
+      { role: "assistant", stopReason: "toolUse", content: [] },
+      { role: "toolResult", toolName: "bash", isError: true },
+      ...reply,
+    ];
+    const sessionManager = {
+      getEntries: () => [{ type: "session" }, ...session.map((message) => ({ type: "message", message }))],
+    };
+    await handlers.agent_end({ messages: session.slice(2) }, { ...ctx, sessionManager });
+    assert.equal(state.shutdown, true);
+    assert.deepEqual(jev.bodies[0].state, {
+      final_message: "report",
+      last_turn: "The final turn ran 1 tool calls and 1 failed. The last tool call (bash) failed.",
+      task: "Write the report.",
+    });
+  });
+
+  it("falls back to Laya when Jev errors", async () => {
+    const jev = await fakeJev(0.9, 500);
+    const laya = await fakeLaya(false);
+    const { handlers, ctx, state } = await launch({
+      PI_JEV_URL: jev.url,
+      TYPESAFE_API_KEY: "k",
+      PI_LAYA_URL: laya.url,
+      PI_SUBAGENT_AUTO_EXIT: "1",
+    });
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(jev.bodies.length, 1);
+    assert.equal(state.shutdown, false, "Laya's keep-open wins over the autoExit flag");
+    handlers.input({}, ctx); // clears the idle timer
   });
 
   it("skips Laya on interactive turns the user started", async () => {

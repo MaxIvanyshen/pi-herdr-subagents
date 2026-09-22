@@ -197,15 +197,27 @@ All configuration is via environment variables (set globally, or per-project via
 | `PI_HERDR_HOLD_OPEN_SECS` | `15` | Startup-crash window: if the child exits nonzero within this many seconds, the pane is held open for post-mortem (`0` disables). |
 | `HERDR_BIN` | `herdr` on `PATH` | herdr binary override. |
 | `PI_LAYA_URL` | `http://127.0.0.1:8771` | Laya sidecar the child asks "done or waiting on you?" (see below). |
-| `PI_LAYA_IDLE_SECS` | `600` | An auto-exit child that Laya kept open exits as done after this long with no input. |
+| `PI_LAYA_IDLE_SECS` | `600` | An auto-exit child that the decider kept open exits as done after this long with no input. |
+| `TYPESAFE_API_KEY` / `JEV_API_KEY` | *(unset)* | Key for the Jev decider. Children don't inherit your shell's env, so `~/.pi/laya/typesafe-key` (chmod 600) is the reliable place. |
 
-### Idle decision via Laya (experimental)
+### Idle decision: done or waiting on you? (experimental)
 
-When a child's turn ends cleanly, it asks a local [Laya](https://brainfunctioncollapse.com/laya)
-sidecar whether the last message is a finished report or a question for the user. If Laya says
-done, the child exits with `completed`, **even if `auto-exit` is off**. If it sees a question, the
-pane stays open, even when `auto-exit` is on. Interactive turns you started yourself skip Laya.
-If the sidecar isn't running, the plain `auto-exit` flag decides, as before.
+When a child's turn ends cleanly, a classifier decides whether it's finished or waiting on you.
+If it says finished, the child exits with `completed`, **even if `auto-exit` is off**. If it says
+blocked or unsure, the pane stays open, even when `auto-exit` is on. Interactive turns you
+started yourself skip the decider.
+
+Switch deciders with `/subagent-decider [jev|laya|off]`, or run it with no argument to see the
+current one. Running children pick up the change at their next decision.
+
+| Mode | Decider | Sees | Leaves the machine |
+|---|---|---|---|
+| `jev` (default) | [TypeSafe Jev](https://docs.typesafe.ai); falls back to Laya without a key or on errors | brief, final reply, last-turn tool outcomes | yes, to api.typesafe.ai |
+| `laya` | local [Laya](https://brainfunctioncollapse.com/laya) sidecar | final reply | no |
+| `off` | none; the `auto-exit` flag decides, as before | — | no |
+
+With no decider reachable, the `auto-exit` flag decides as before. `laya/compare.py` benchmarks
+both deciders on your own past sessions. At the time of writing, Jev had AUC 0.993 and Laya 0.895.
 
 ```bash
 uv run --python 3.12 --with laya python laya/server.py         # ~30s first load, then ~50ms/call
@@ -249,6 +261,7 @@ Set `PI_HERDR_DIRENV=0` or an explicit `PI_HERDR_LAUNCH_PREFIX` to override.
 | `/subagent <agent> [task]` | Spawn a named agent directly |
 | `/subagents-init [global\|project]` | Copy missing example agent definitions into user-owned config |
 | `/iterate [task]` | Fork the current session into a subagent for focused work |
+| `/subagent-decider [jev\|laya\|off]` | Pick who decides whether an idle subagent exits (see [Idle decision](#idle-decision-done-or-waiting-on-you-experimental)) |
 
 Agent definitions in project-local `.pi/agents/*.md` or global `~/.pi/agent/agents/*.md` are read
 with the same frontmatter semantics as pi-interactive-subagents (name, description, tools,

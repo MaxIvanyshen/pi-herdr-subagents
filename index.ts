@@ -51,6 +51,13 @@ import {
 } from "./src/messages.ts";
 import { markSubagentActive, markSubagentInactive } from "./src/runtime-state.ts";
 import {
+  DECIDER_MODES,
+  type DeciderMode,
+  jevKeyFile,
+  readDeciderMode,
+  writeDeciderMode,
+} from "./src/idle-decider.ts";
+import {
   findLastAssistantMessage,
   getNewEntries,
   getSessionId,
@@ -1266,6 +1273,42 @@ function registerCommands(pi: ExtensionAPI): void {
         ].join("\n"),
         "info",
       );
+    },
+  });
+
+  // /subagent-decider — who decides whether an idle subagent exits (src/idle-decider.ts)
+  const deciderHelp: Record<DeciderMode, string> = {
+    jev: "TypeSafe Jev (sends brief + final reply to api.typesafe.ai), Laya fallback",
+    laya: "local Laya sidecar only, nothing leaves the machine",
+    off: "no classifier; the auto-exit flag decides",
+  };
+  pi.registerCommand("subagent-decider", {
+    description: "Idle subagent exit decider: /subagent-decider [jev|laya|off]",
+    getArgumentCompletions: (prefix) => {
+      const options = DECIDER_MODES.filter((m) => m.startsWith(prefix)).map((m) => ({
+        value: m,
+        label: m,
+        description: deciderHelp[m],
+      }));
+      return options.length > 0 ? options : null;
+    },
+    handler: async (args, ctx) => {
+      const mode = args.trim();
+      if (mode) {
+        if (!(DECIDER_MODES as string[]).includes(mode)) {
+          ctx.ui.notify("Usage: /subagent-decider [jev|laya|off]", "error");
+          return;
+        }
+        writeDeciderMode(mode as DeciderMode);
+      }
+      const current = readDeciderMode();
+      // Children get a curated env (src/launch.ts), so this pane's env vars don't
+      // reach them; the key file is what they can rely on.
+      const keyNote =
+        current === "jev" && !existsSync(jevKeyFile())
+          ? ` — no ${jevKeyFile()}; subagents don't inherit this shell's env, so they'll likely fall back to Laya`
+          : "";
+      ctx.ui.notify(`Subagent decider: ${current} (${deciderHelp[current]})${keyNote}`, "info");
     },
   });
 

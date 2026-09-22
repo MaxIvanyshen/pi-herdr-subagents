@@ -20,6 +20,13 @@ import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 
 import { writeContextUsageSidecar } from "./src/context-usage.ts";
+import {
+  firstUserText,
+  jevDecide,
+  lastTurnSummary,
+  readDeciderMode,
+  readJevKey,
+} from "./src/idle-decider.ts";
 import { getActiveSubagentCount } from "./src/runtime-state.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -84,6 +91,18 @@ export function lastAssistantText(messages: any[] | undefined): string {
     if (text.trim()) return text;
   }
   return "";
+}
+
+/** Every message in the session file, in order; undefined if the session isn't readable. */
+function sessionMessages(ctx: any): any[] | undefined {
+  try {
+    return ctx.sessionManager
+      ?.getEntries()
+      .filter((e: any) => e.type === "message")
+      .map((e: any) => e.message);
+  } catch {
+    return undefined;
+  }
 }
 
 async function layaPost(url: string, body: object, timeoutMs: number): Promise<any> {
@@ -270,13 +289,20 @@ export default function (pi: ExtensionAPI) {
     const turnSettled = shouldAutoExitOnAgentEnd(userTookOver, messages, getActiveSubagentCount());
     let shouldExit = autoExit && turnSettled;
 
-    // Let Laya decide done vs. waiting-on-the-user, except for interactive turns
-    // the user started themselves: they're at the pane. Unreachable sidecar →
-    // plain autoExit behaviour.
+    // Let a classifier decide done vs. waiting-on-the-user (src/idle-decider.ts),
+    // except for interactive turns the user started themselves: they're at the
+    // pane. Mode "off" or no classifier reachable → plain autoExit behaviour.
     const text = lastAssistantText(messages);
-    if (turnSettled && text && !terminalSidecarWritten && (autoExit || !userTookOver)) {
+    const mode = readDeciderMode();
+    if (mode !== "off" && turnSettled && text && !terminalSidecarWritten && (autoExit || !userTookOver)) {
       inputSinceAgentEnd = false;
-      const done = await layaDecide(layaUrl, text);
+      const key = mode === "jev" ? readJevKey() : undefined;
+      // event.messages holds only this run; the brief and a retried turn's tool
+      // results live in the session — the same data laya/server.py replays.
+      const history = sessionMessages(ctx) ?? messages;
+      const input = { finalMessage: text.trim(), lastTurn: lastTurnSummary(history), task: firstUserText(history) };
+      const viaJev = key ? await jevDecide(key, input, process.env.PI_JEV_URL || undefined) : null;
+      const done = viaJev ?? (await layaDecide(layaUrl, text));
       // Input during the await (user or subagent_steer) started a new turn — never kill it.
       shouldExit = (done ?? shouldExit) && !inputSinceAgentEnd;
       if (done === false && !inputSinceAgentEnd) {
