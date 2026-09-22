@@ -196,41 +196,27 @@ All configuration is via environment variables (set globally, or per-project via
 | `PI_HERDR_DIRENV` | *(unset)* | Set to `0` to disable the `direnv exec` autodetect (see below). |
 | `PI_HERDR_HOLD_OPEN_SECS` | `15` | Startup-crash window: if the child exits nonzero within this many seconds, the pane is held open for post-mortem (`0` disables). |
 | `HERDR_BIN` | `herdr` on `PATH` | herdr binary override. |
-| `PI_LAYA_URL` | `http://127.0.0.1:8771` | Laya sidecar the child asks "done or waiting on you?" (see below). |
-| `PI_LAYA_IDLE_SECS` | `600` | An auto-exit child that the decider kept open exits as done after this long with no input. |
-| `TYPESAFE_API_KEY` / `JEV_API_KEY` | *(unset)* | Key for the Jev decider. Children don't inherit your shell's env, so `~/.pi/laya/typesafe-key` (chmod 600) is the reliable place. |
+| `PI_SUBAGENT_IDLE_SECS` | `600` | An auto-exit child that the decider kept open exits as done after this long with no input. |
+| `TYPESAFE_API_KEY` / `JEV_API_KEY` | *(unset)* | Key for the idle decider. Children don't inherit your shell's env, so `~/.pi/subagent-decider/typesafe-key` (chmod 600) is the reliable place. |
 
 ### Idle decision: done or waiting on you? (experimental)
 
-When a child's turn ends cleanly, a classifier decides whether it's finished or waiting on you.
-If it says finished, the child exits with `completed`, **even if `auto-exit` is off**. If it says
-blocked or unsure, the pane stays open, even when `auto-exit` is on. Interactive turns you
-started yourself skip the decider.
+When a child's turn ends cleanly, [TypeSafe Jev](https://docs.typesafe.ai) decides whether it's
+finished or waiting on you. It gets the task brief, the final reply, and a one-line summary of the
+last turn's tool outcomes. If Jev says finished, the child exits with `completed`, **even if
+`auto-exit` is off**. If it says blocked or unsure, the pane stays open, even when `auto-exit` is
+on. An auto-exit child kept open this way exits as done after `PI_SUBAGENT_IDLE_SECS` with no
+input, so an unattended parent never waits forever. Interactive turns you started yourself skip
+the decider.
 
-Switch deciders with `/subagent-decider [jev|laya|off]`, or run it with no argument to see the
-current one. Running children pick up the change at their next decision.
+The decider leans toward exiting. A wrong exit is cheap, because the parent can resume the
+subagent, while a wrong keep-open stalls the parent. On ~200 replayed subagent sessions plus
+hand-written edge cases, it kept no finished report open.
 
-| Mode | Decider | Sees | Leaves the machine |
-|---|---|---|---|
-| `jev` (default) | [TypeSafe Jev](https://docs.typesafe.ai); falls back to Laya without a key or on errors | brief, final reply, last-turn tool outcomes | yes, to api.typesafe.ai |
-| `laya` | local [Laya](https://brainfunctioncollapse.com/laya) sidecar | final reply | no |
-| `off` | none; the `auto-exit` flag decides, as before | — | no |
-
-With no decider reachable, the `auto-exit` flag decides as before. `laya/compare.py` benchmarks
-both deciders on your own past sessions. At the time of writing, Jev had AUC 0.993 and Laya 0.895.
-
-```bash
-uv run --python 3.12 --with laya python laya/server.py         # ~30s first load, then ~50ms/call
-uv run --python 3.12 --with laya python laya/server.py --eval  # held-out accuracy
-```
-
-It is tuned to lean toward exiting. A wrong exit is cheap, because the parent can resume the
-subagent. A wrong keep-open stalls the parent, so it costs `LAYA_KEEP_OPEN_COST` (default 5)
-times more in the threshold fit. The threshold is fit on:
-- the `laya/examples.jsonl` seeds;
-- your past subagent sessions in `~/.pi/agent/sessions`;
-- your labels in `~/.pi/laya/labels.jsonl`. A kept-open pane you reply to is labelled
-  "needs input", and one you close without replying is labelled "done".
+`/subagent-decider off` turns it off. Nothing is then sent to api.typesafe.ai, and the `auto-exit`
+flag decides, as it also does without a key or when Jev doesn't answer within 3s.
+`/subagent-decider jev` turns it back on. Running `/subagent-decider` with no argument shows the
+current mode. Running children pick up a change at their next decision.
 
 ### direnv / devenv / varlock repos
 
@@ -261,7 +247,7 @@ Set `PI_HERDR_DIRENV=0` or an explicit `PI_HERDR_LAUNCH_PREFIX` to override.
 | `/subagent <agent> [task]` | Spawn a named agent directly |
 | `/subagents-init [global\|project]` | Copy missing example agent definitions into user-owned config |
 | `/iterate [task]` | Fork the current session into a subagent for focused work |
-| `/subagent-decider [jev\|laya\|off]` | Pick who decides whether an idle subagent exits (see [Idle decision](#idle-decision-done-or-waiting-on-you-experimental)) |
+| `/subagent-decider [jev\|off]` | Pick who decides whether an idle subagent exits (see [Idle decision](#idle-decision-done-or-waiting-on-you-experimental)) |
 
 Agent definitions in project-local `.pi/agents/*.md` or global `~/.pi/agent/agents/*.md` are read
 with the same frontmatter semantics as pi-interactive-subagents (name, description, tools,

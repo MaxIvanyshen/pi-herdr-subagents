@@ -526,23 +526,26 @@ describe("subagent-done: agent_end writes .exit sidecar on clean auto-exit", () 
   });
 });
 
-describe("subagent-done: Laya decides exit vs keep-open", () => {
+describe("subagent-done: Jev decides exit vs keep-open", () => {
   const reply = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "report" }] }];
+  const FINISHED = 0.9;
+  const WAITING = 0.01;
 
-  // Fake laya/server.py: /decide answers `done`, /label requests are recorded.
-  async function fakeLaya(done: boolean) {
-    const labels: any[] = [];
+  // Fake api.typesafe.ai: answers p(finished), records request bodies.
+  async function fakeJev(finished: number, status = 200) {
+    const bodies: any[] = [];
     const server = createServer((req, res) => {
       let body = "";
       req.on("data", (c) => (body += c));
       req.on("end", () => {
-        if (req.url === "/label") labels.push(JSON.parse(body));
-        res.end(JSON.stringify({ done }));
+        bodies.push(JSON.parse(body));
+        res.statusCode = status;
+        res.end(JSON.stringify({ answers: { q: { probabilities: { finished } } } }));
       });
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     cleanups.push(() => server.close());
-    return { url: `http://127.0.0.1:${(server.address() as any).port}`, labels };
+    return { url: `http://127.0.0.1:${(server.address() as any).port}`, bodies };
   }
 
   async function launch(env: Record<string, string>) {
@@ -555,6 +558,7 @@ describe("subagent-done: Laya decides exit vs keep-open", () => {
       HOME: dir,
       TYPESAFE_API_KEY: "",
       JEV_API_KEY: "",
+      PI_JEV_URL: "",
       ...env,
     };
     const orig = Object.fromEntries(Object.keys(all).map((k) => [k, process.env[k]]));
@@ -578,116 +582,31 @@ describe("subagent-done: Laya decides exit vs keep-open", () => {
     return { handlers, ctx, state, sessionFile };
   }
 
-  it("closes an interactive subagent Laya judges done", async () => {
-    const laya = await fakeLaya(true);
-    const { handlers, ctx, state, sessionFile } = await launch({ PI_LAYA_URL: laya.url });
+  const withJev = (url: string, env: Record<string, string> = {}) =>
+    launch({ PI_JEV_URL: url, TYPESAFE_API_KEY: "k", ...env });
+
+  it("closes an interactive subagent Jev judges finished", async () => {
+    const jev = await fakeJev(FINISHED);
+    const { handlers, ctx, state, sessionFile } = await withJev(jev.url);
     await handlers.agent_end({ messages: reply }, ctx);
     assert.equal(state.shutdown, true);
     assert.equal(readFileSync(`${sessionFile}.exit`, "utf8"), '{"type":"done"}');
   });
 
-  it("keeps an auto-exit subagent open when Laya sees a question, labels it on reply", async () => {
-    const laya = await fakeLaya(false);
-    const { handlers, ctx, state, sessionFile } = await launch({
-      PI_LAYA_URL: laya.url,
-      PI_SUBAGENT_AUTO_EXIT: "1",
-    });
+  it("keeps an auto-exit subagent open when Jev sees it waiting", async () => {
+    const jev = await fakeJev(WAITING);
+    const { handlers, ctx, state, sessionFile } = await withJev(jev.url, { PI_SUBAGENT_AUTO_EXIT: "1" });
     await handlers.agent_end({ messages: reply }, ctx);
     assert.equal(state.shutdown, false);
     assert.equal(existsSync(`${sessionFile}.exit`), false);
-
-    handlers.input({}, ctx);
-    for (let i = 0; i < 50 && laya.labels.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
-    assert.deepEqual(laya.labels, [{ text: "report", done: false }]);
+    handlers.input({}, ctx); // clears the idle timer
   });
 
-  it("labels done when a kept-open pane closes without input", async () => {
-    const laya = await fakeLaya(false);
-    const { handlers, ctx } = await launch({ PI_LAYA_URL: laya.url });
-    await handlers.agent_end({ messages: reply }, ctx);
-    await handlers.session_shutdown({}, { ...ctx, getContextUsage: () => undefined });
-    assert.deepEqual(laya.labels, [{ text: "report", done: true }]);
-  });
-
-  it("falls back to the autoExit flag when the sidecar is unreachable", async () => {
-    const { handlers, ctx, state } = await launch({
-      PI_LAYA_URL: "http://127.0.0.1:1",
-      PI_SUBAGENT_AUTO_EXIT: "1",
-    });
-    await handlers.agent_end({ messages: reply }, ctx);
-    assert.equal(state.shutdown, true);
-  });
-
-  it("never shuts down a turn the user started while Laya was unreachable", async () => {
-    const { handlers, ctx, state } = await launch({
-      PI_LAYA_URL: "http://127.0.0.1:1",
-      PI_SUBAGENT_AUTO_EXIT: "1",
-    });
-    const pending = handlers.agent_end({ messages: reply }, ctx);
-    handlers.input({}, ctx); // typed during the await
-    await pending;
-    assert.equal(state.shutdown, false);
-  });
-
-  it("gives up on a kept-open auto-exit subagent after the idle timeout, unlabelled", async () => {
-    const laya = await fakeLaya(false);
-    const { handlers, ctx, state, sessionFile } = await launch({
-      PI_LAYA_URL: laya.url,
-      PI_SUBAGENT_AUTO_EXIT: "1",
-      PI_LAYA_IDLE_SECS: "0.05",
-    });
-    await handlers.agent_end({ messages: reply }, ctx);
-    assert.equal(state.shutdown, false);
-    await new Promise((r) => setTimeout(r, 120));
-    assert.equal(state.shutdown, true);
-    assert.equal(readFileSync(`${sessionFile}.exit`, "utf8"), '{"type":"done"}');
-    await handlers.session_shutdown({}, { ...ctx, getContextUsage: () => undefined });
-    assert.deepEqual(laya.labels, []);
-  });
-
-  it("input cancels the idle timeout", async () => {
-    const laya = await fakeLaya(false);
-    const { handlers, ctx, state } = await launch({
-      PI_LAYA_URL: laya.url,
-      PI_SUBAGENT_AUTO_EXIT: "1",
-      PI_LAYA_IDLE_SECS: "0.05",
-    });
-    await handlers.agent_end({ messages: reply }, ctx);
-    handlers.input({}, ctx);
-    await new Promise((r) => setTimeout(r, 120));
-    assert.equal(state.shutdown, false);
-  });
-
-  it("mode off consults no classifier", async () => {
-    const laya = await fakeLaya(true);
-    const { handlers, ctx, state } = await launch({ PI_LAYA_URL: laya.url });
-    writeDeciderMode("off");
-    await handlers.agent_end({ messages: reply }, ctx);
-    assert.equal(state.shutdown, false, "interactive + no classifier stays open");
-  });
-
-  // Fake api.typesafe.ai: answers p(finished), records request bodies.
-  async function fakeJev(finished: number, status = 200) {
-    const bodies: any[] = [];
-    const server = createServer((req, res) => {
-      let body = "";
-      req.on("data", (c) => (body += c));
-      req.on("end", () => {
-        bodies.push(JSON.parse(body));
-        res.statusCode = status;
-        res.end(JSON.stringify({ answers: { q: { probabilities: { finished } } } }));
-      });
-    });
-    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-    cleanups.push(() => server.close());
-    return { url: `http://127.0.0.1:${(server.address() as any).port}`, bodies };
-  }
-
-  it("jev mode sends brief + reply + last turn and acts on the answer", async () => {
-    const jev = await fakeJev(0.9);
-    const { handlers, ctx, state } = await launch({ PI_JEV_URL: jev.url, TYPESAFE_API_KEY: "k" });
+  it("sends brief + reply + last turn from the session, not just this run", async () => {
+    const jev = await fakeJev(FINISHED);
+    const { handlers, ctx, state } = await withJev(jev.url);
     // Resumed session: this run's event only has the resume prompt; the brief is
-    // in the session, as it is in the replayed training data.
+    // in the session.
     const session = [
       { role: "user", content: [{ type: "text", text: "Write the report. " }] },
       { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "draft" }] },
@@ -708,26 +627,70 @@ describe("subagent-done: Laya decides exit vs keep-open", () => {
     });
   });
 
-  it("falls back to Laya when Jev errors", async () => {
-    const jev = await fakeJev(0.9, 500);
-    const laya = await fakeLaya(false);
-    const { handlers, ctx, state } = await launch({
-      PI_JEV_URL: jev.url,
-      TYPESAFE_API_KEY: "k",
-      PI_LAYA_URL: laya.url,
-      PI_SUBAGENT_AUTO_EXIT: "1",
-    });
+  it("falls back to the autoExit flag when Jev errors", async () => {
+    const jev = await fakeJev(WAITING, 500);
+    const { handlers, ctx, state } = await withJev(jev.url, { PI_SUBAGENT_AUTO_EXIT: "1" });
     await handlers.agent_end({ messages: reply }, ctx);
     assert.equal(jev.bodies.length, 1);
-    assert.equal(state.shutdown, false, "Laya's keep-open wins over the autoExit flag");
-    handlers.input({}, ctx); // clears the idle timer
+    assert.equal(state.shutdown, true);
   });
 
-  it("skips Laya on interactive turns the user started", async () => {
-    const laya = await fakeLaya(true);
-    const { handlers, ctx, state } = await launch({ PI_LAYA_URL: laya.url });
+  it("without a key, asks nothing and follows the autoExit flag", async () => {
+    const { handlers, ctx, state } = await launch({ PI_SUBAGENT_AUTO_EXIT: "1" });
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(state.shutdown, true);
+  });
+
+  it("mode off asks nothing", async () => {
+    const jev = await fakeJev(FINISHED);
+    const { handlers, ctx, state } = await withJev(jev.url);
+    writeDeciderMode("off");
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(jev.bodies.length, 0);
+    assert.equal(state.shutdown, false, "interactive + no decider stays open");
+  });
+
+  it("never shuts down a turn the user started while Jev was answering", async () => {
+    const jev = await fakeJev(FINISHED);
+    const { handlers, ctx, state } = await withJev(jev.url, { PI_SUBAGENT_AUTO_EXIT: "1" });
+    const pending = handlers.agent_end({ messages: reply }, ctx);
+    handlers.input({}, ctx); // typed during the await
+    await pending;
+    assert.equal(state.shutdown, false);
+  });
+
+  it("gives up on a kept-open auto-exit subagent after the idle timeout", async () => {
+    const jev = await fakeJev(WAITING);
+    const { handlers, ctx, state, sessionFile } = await withJev(jev.url, {
+      PI_SUBAGENT_AUTO_EXIT: "1",
+      PI_SUBAGENT_IDLE_SECS: "0.05",
+    });
+    await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(state.shutdown, false);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(state.shutdown, true);
+    assert.equal(readFileSync(`${sessionFile}.exit`, "utf8"), '{"type":"done"}');
+  });
+
+  it("input cancels the idle timeout", async () => {
+    const jev = await fakeJev(WAITING);
+    const { handlers, ctx, state } = await withJev(jev.url, {
+      PI_SUBAGENT_AUTO_EXIT: "1",
+      PI_SUBAGENT_IDLE_SECS: "0.05",
+    });
+    await handlers.agent_end({ messages: reply }, ctx);
+    handlers.input({}, ctx);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(state.shutdown, false);
+  });
+
+  it("skips Jev on interactive turns the user started", async () => {
+    const jev = await fakeJev(FINISHED);
+    const { handlers, ctx, state } = await withJev(jev.url);
     handlers.input({}, ctx); // after agent_start → user took over
     await handlers.agent_end({ messages: reply }, ctx);
+    assert.equal(jev.bodies.length, 0);
     assert.equal(state.shutdown, false);
   });
 });
+

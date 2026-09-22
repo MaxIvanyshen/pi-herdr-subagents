@@ -3,48 +3,47 @@
  * child extension (subagent-done.ts): should a subagent whose turn just ended
  * exit as done, or stay open for the user?
  *
- * Modes (persisted in ~/.pi/laya/mode, read by children on every decision):
- *   jev  — TypeSafe Jev, given the brief + final reply + last-turn tool summary;
- *          falls back to the local Laya sidecar when there's no key or Jev fails.
- *   laya — local Laya sidecar only (laya/server.py), final reply only. Nothing leaves the machine.
- *   off  — no classifier; the agent's auto-exit flag decides, as before.
+ * Modes (persisted in ~/.pi/subagent-decider/mode, read by children on every decision):
+ *   jev — TypeSafe Jev, given the brief + final reply + last-turn tool summary.
+ *   off — no classifier; the agent's auto-exit flag decides.
+ * Without a key, or when Jev doesn't answer, the auto-exit flag decides too.
  *
- * Numbers behind the choices are in laya/compare.py (Jev +task+turn: AUC 0.993 on
- * replayed sessions + seeds).
+ * Benchmarked on ~200 replayed subagent sessions plus hand-written edge cases:
+ * AUC 0.993, no finished report kept open on the held-out split.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type DeciderMode = "jev" | "laya" | "off";
-export const DECIDER_MODES: DeciderMode[] = ["jev", "laya", "off"];
+export type DeciderMode = "jev" | "off";
+export const DECIDER_MODES: DeciderMode[] = ["jev", "off"];
 
 const JEV_URL = "https://api.typesafe.ai/v1/systemone";
-// Jev's p(finished) separates cleanly around here; fit in compare.py with a
-// wrong keep-open costing 5x a wrong exit.
+// Jev's p(finished) separates cleanly around here; fit with a wrong keep-open
+// costing 5x a wrong exit (the parent can resume a subagent that exited early).
 export const JEV_THRESHOLD = 0.065;
 
 // Lazily resolved so tests can point HOME elsewhere.
-const layaDir = () => join(homedir(), ".pi", "laya");
+const deciderDir = () => join(homedir(), ".pi", "subagent-decider");
 
 export function readDeciderMode(): DeciderMode {
   try {
-    const mode = readFileSync(join(layaDir(), "mode"), "utf8").trim();
+    const mode = readFileSync(join(deciderDir(), "mode"), "utf8").trim();
     if ((DECIDER_MODES as string[]).includes(mode)) return mode as DeciderMode;
   } catch {}
   return "jev";
 }
 
 export function writeDeciderMode(mode: DeciderMode): void {
-  mkdirSync(layaDir(), { recursive: true });
-  writeFileSync(join(layaDir(), "mode"), mode + "\n");
+  mkdirSync(deciderDir(), { recursive: true });
+  writeFileSync(join(deciderDir(), "mode"), mode + "\n");
 }
 
 /**
- * Children don't get the orchestrator's full env, so besides the env vars a
- * key can live in ~/.pi/laya/typesafe-key (chmod 600).
+ * Children don't get the orchestrator's full env, so besides the env vars the
+ * key can live in ~/.pi/subagent-decider/typesafe-key (chmod 600).
  */
-export const jevKeyFile = () => join(layaDir(), "typesafe-key");
+export const jevKeyFile = () => join(deciderDir(), "typesafe-key");
 
 export function readJevKey(): string | undefined {
   const fromEnv = process.env.TYPESAFE_API_KEY || process.env.JEV_API_KEY;
@@ -56,7 +55,7 @@ export function readJevKey(): string | undefined {
   }
 }
 
-// Mirrors msg_text() in laya/server.py: string content as-is, part lists joined and trimmed.
+// String content as-is, part lists joined and trimmed — as in the benchmark data.
 function messageText(msg: any): string {
   if (typeof msg?.content === "string") return msg.content;
   return (msg?.content ?? [])
@@ -73,8 +72,8 @@ export function firstUserText(messages: any[] | undefined): string {
 }
 
 /**
- * Tool outcomes of the latest turn, in words — Jev/Laya can't compare numbers.
- * Must match last_turn() in laya/server.py, which produced the training data.
+ * Tool outcomes of the latest turn, in words — the model can't compare numbers.
+ * Wording is what the benchmark used; changing it invalidates JEV_THRESHOLD.
  */
 export function lastTurnSummary(messages: any[] | undefined): string {
   const results: any[] = [];
@@ -92,7 +91,6 @@ export function lastTurnSummary(messages: any[] | undefined): string {
   );
 }
 
-/** Same question compare.py measured as "+task+turn". */
 const JEV_QUESTION = {
   type: "choice",
   instructions:
@@ -106,7 +104,7 @@ const JEV_QUESTION = {
 
 /**
  * Ask Jev whether the subagent is finished. null = no answer (network, auth,
- * timeout) — the caller falls back.
+ * timeout) — the caller falls back to the auto-exit flag.
  */
 export async function jevDecide(
   key: string,
@@ -119,7 +117,7 @@ export async function jevDecide(
       headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
       body: JSON.stringify({
         model: "jev-latest",
-        // Same field order and truncation as compare.py.
+        // Field order and truncation as benchmarked.
         state: {
           final_message: input.finalMessage.slice(-1500),
           last_turn: input.lastTurn,
