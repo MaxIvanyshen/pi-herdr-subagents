@@ -580,8 +580,8 @@ async function executeSubagentSpawn(
     return errorResult(`Failed to start herdr pane for "${params.name}": ${message}`, message);
   }
   // Best-effort sidebar/tab label; the pane is already running the subagent.
-  await deps.client.paneRename(started.paneId, params.name).catch(() => {});
-  if (started.tabId) await deps.client.tabRename(started.tabId, params.name).catch(() => {});
+  await deps.client.paneRename(started.paneId, plan.paneStart.name).catch(() => {});
+  if (started.tabId) await deps.client.tabRename(started.tabId, plan.paneStart.name).catch(() => {});
 
   const running: RunningSubagent = {
     id: plan.id,

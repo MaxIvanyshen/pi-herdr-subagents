@@ -415,6 +415,7 @@ describe("launch plan: structure", () => {
       systemPromptMode: "append",
     });
     assert.deepEqual(p.piArgv, ["codex", "--model", "gpt-5"]);
+    assert.equal(p.paneStart.name, `${p.name} - codex`);
     assert.equal(p.autoExit, true);
     assert.equal(p.interactive, false);
     assert.equal(p.seedSession, null);
@@ -430,8 +431,10 @@ describe("launch plan: structure", () => {
     assert.ok(scriptOf(p).includes("'codex' '--model' 'gpt-5'"));
   });
 
-  it("pi children carry no herdr agent driver", () => {
-    assert.equal(plan(makeFixture()).herdrAgent, null);
+  it("pi children carry no herdr agent driver and keep the plain tab label", () => {
+    const p = plan(makeFixture());
+    assert.equal(p.herdrAgent, null);
+    assert.equal(p.paneStart.name, p.name);
   });
 
   it("the cli tool param picks the agent without an agent def, and overrides the def's cli", () => {

@@ -98,6 +98,7 @@ export interface LaunchPlan {
   } | null;
   /** Arguments for HerdrClient.paneStart(). */
   paneStart: {
+    /** Tab/pane label: the subagent name, plus the agent kind for non-pi children ("find date - claude"). */
     name: string;
     cwd: string;
     /** Orchestrator's own pane (HERDR_PANE_ID) — the new pane splits off it. */
@@ -504,7 +505,7 @@ export function buildLaunchPlan(
     files,
     seedSession,
     paneStart: {
-      name: params.name,
+      name: agentKind ? `${params.name} - ${agentKind}` : params.name,
       cwd: targetCwd,
       targetPaneId: env.HERDR_PANE_ID,
       direction: "right",
