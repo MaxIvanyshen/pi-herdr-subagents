@@ -20,7 +20,7 @@
 //   PI_HERDR_HOLD_OPEN_SECS, default 15) the script holds the pane open for
 //   post-mortem — the sidecar, not pane.exited, is the completion signal then.
 //
-// buildSubagentToolAllowlist / buildPiPromptArgs / shellEscape and artifact
+// buildPiPromptArgs / shellEscape and artifact
 // conventions ported from pi-interactive-subagents (MIT, HazAT)
 // pi-extension/subagents/{index.ts,cmux.ts} @ fix/launch-verify-retry.
 import { accessSync, constants, existsSync, statSync } from "node:fs";
@@ -126,30 +126,31 @@ export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+// Mirrors pi's allToolNames (core/tools/index.ts).
+const PI_BUILTIN_TOOLS = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"] as const;
 
 /**
- * Build the child --tools allowlist.
+ * Turn an agent's `tools:` restriction into a child --exclude-tools list.
  *
- * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
- * subagent definition restricts tools to e.g. "read,bash,write", the child
- * control tools from subagent-done.ts would otherwise be hidden, leaving a
- * manually resumed or user-touched subagent unable to call subagent_done.
+ * pi's --tools allowlist filters the tool registry itself, extension tools
+ * included, so a "read,bash" subagent silently lost every extension tool
+ * (subagent_done, expand_chunk, search_evidence, web_*). An extension that
+ * rewrites tool output to point at expand_chunk then left the child stuck.
+ * `tools:` therefore only restricts pi's built-ins; extension tools stay, and
+ * `deny-tools` remains the way to take one away.
  */
-export function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
-  const requested = (effectiveTools ?? "")
-    .split(",")
-    .map((tool) => tool.trim())
-    .filter(Boolean);
+export function buildSubagentToolExclusions(effectiveTools?: string): string | null {
+  const requested = new Set(
+    (effectiveTools ?? "")
+      .split(",")
+      .map((tool) => tool.trim())
+      .filter(Boolean),
+  );
 
-  if (requested.length === 0) return null;
+  if (requested.size === 0) return null;
 
-  const allow = new Set(requested);
-  for (const tool of SUBAGENT_CONTROL_TOOLS) {
-    allow.add(tool);
-  }
-
-  return [...allow].join(",");
+  const excluded = PI_BUILTIN_TOOLS.filter((tool) => !requested.has(tool));
+  return excluded.length > 0 ? excluded.join(",") : null;
 }
 
 /**
@@ -429,9 +430,9 @@ export function buildLaunchPlan(
       );
     }
 
-    const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-    if (toolAllowlist) {
-      piArgv.push("--tools", toolAllowlist);
+    const toolExclusions = buildSubagentToolExclusions(effectiveTools);
+    if (toolExclusions) {
+      piArgv.push("--exclude-tools", toolExclusions);
     }
 
     // Task delivery: fork inherits the conversation → direct arg; blank-session

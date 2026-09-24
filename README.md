@@ -261,6 +261,11 @@ runtime fallback; `/subagents-init` explicitly copies them into one of these use
 locations. A `subagent_done` / `caller_ping` child extension is loaded into every child for the
 completion handshake.
 
+`tools:` restricts only pi's built-in tools (`read`, `bash`, `edit`, `write`, …) — it becomes a
+child `--exclude-tools` list, not `--tools`. Extension tools (`expand_chunk`, `search_evidence`,
+`web_fetch`, …) always reach the child, since pi's `--tools` allowlist would hide them and strand a
+child whose tool output an extension rewrote. Use `deny-tools` to take an extension tool away.
+
 ## Lifecycle: every child ends in exactly one honest state
 
 The watcher classifies each child from socket events + sidecar files. There is **no path to an

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import {
   buildLaunchPlan,
   buildPiPromptArgs,
-  buildSubagentToolAllowlist,
+  buildSubagentToolExclusions,
   shellEscape,
   type LaunchPlan,
   type LaunchPlanContext,
@@ -310,16 +310,18 @@ describe("launch plan: pi argv", () => {
     assert.ok(task?.content.includes("You are a worker."));
   });
 
-  it("--tools allowlist always includes caller_ping and subagent_done", () => {
+  it("tools restriction excludes only the unrequested built-ins, never extension tools", () => {
     const fx = makeFixture();
-    const p = plan(fx, {}, { tools: "read,bash" });
-    const argv = p.piArgv;
-    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,caller_ping,subagent_done");
+    const argv = plan(fx, {}, { tools: "read,bash" }).piArgv;
+    assert.ok(!argv.includes("--tools"));
+    assert.equal(argv[argv.indexOf("--exclude-tools") + 1], "powershell,edit,write,grep,find,ls");
   });
 
-  it("omits --tools without an explicit restriction", () => {
+  it("omits tool flags without an explicit restriction", () => {
     const fx = makeFixture();
-    assert.ok(!plan(fx).piArgv.includes("--tools"));
+    const argv = plan(fx).piArgv;
+    assert.ok(!argv.includes("--tools"));
+    assert.ok(!argv.includes("--exclude-tools"));
   });
 
   it("passes skill prompts with the empty-separator trick for artifact delivery", () => {
@@ -479,16 +481,17 @@ describe("ported helpers", () => {
     assert.equal(shellEscape(""), "''");
   });
 
-  it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
+  it("buildSubagentToolExclusions ignores extension tool names in the restriction", () => {
     assert.equal(
-      buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      buildSubagentToolExclusions("read, bash,web_search"),
+      "powershell,edit,write,grep,find,ls",
     );
   });
 
-  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-    assert.equal(buildSubagentToolAllowlist(undefined), null);
-    assert.equal(buildSubagentToolAllowlist(""), null);
+  it("buildSubagentToolExclusions returns null when nothing is restricted", () => {
+    assert.equal(buildSubagentToolExclusions(undefined), null);
+    assert.equal(buildSubagentToolExclusions(""), null);
+    assert.equal(buildSubagentToolExclusions("read,bash,powershell,edit,write,grep,find,ls"), null);
   });
 
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
